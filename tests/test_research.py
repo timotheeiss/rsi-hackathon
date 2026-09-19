@@ -14,7 +14,8 @@ import httpx
 from skilltrainbench import evaluate
 from skilltrainbench.research.engine import Experiment, StopResearch
 from skilltrainbench.research.feedback import aggregate, complete_scores, feedback
-from skilltrainbench.research.optimizer import Astra
+from skilltrainbench.research.optimizer import AstraResearcher, MeteredResponsesModel
+from skilltrainbench.research.tools import ResearchTools
 from skilltrainbench.research.settings import Domain, Settings, load_settings
 from skilltrainbench.research.storage import experiment_lock, read_json, split_tasks, write_json
 from skilltrainbench.tasks import REQUIRED_FILES, Task
@@ -94,16 +95,24 @@ class FakeEvaluator:
             self.active -= 1
 
 
-class FakeProposer:
+class FakeResearchers:
     def __init__(self):
         self.prompts = []
 
-    async def propose(self, prompt, directory):
-        self.prompts.append(prompt)
-        generation = prompt["generation"]
-        return {"analysis": "Improve the general procedure", "candidates": [
-            {"parent_id": prompt["parents"][0]["id"], "hypothesis": f"Test score {value}", "skill_md": skill(value)}
-            for value in (0.7 + generation / 10, -0.1 * generation)[:prompt["count"]]]}
+    def __call__(self, experiment, domain):
+        owner = self
+        class Researcher:
+            async def investigate(self, generation, allowance):
+                owner.prompts.append(experiment.research_brief(domain))
+                parent = experiment.state["champions"][domain]
+                bridge = ResearchTools(experiment, domain)
+                bridge.generation, bridge.allowance = generation, allowance
+                for index, value in enumerate((0.7 + generation / 10, -0.1 * generation)[:allowance]):
+                    bridge.submit_candidate(f"hypothesis-{index}", parent, f"Test score {value}", skill(value))
+
+            async def close(self):
+                pass
+        return Researcher()
 
 
 class ResearchTests(unittest.IsolatedAsyncioTestCase):
@@ -113,7 +122,7 @@ class ResearchTests(unittest.IsolatedAsyncioTestCase):
         self.root = Path(self.temp.name)
         self.cfg = fixture(self.root)
         self.evaluator = FakeEvaluator()
-        self.proposer = FakeProposer()
+        self.proposer = FakeResearchers()
         self.exp = Experiment(self.cfg, self.evaluator, self.proposer)
         self.exp.initialize()
 
@@ -257,17 +266,16 @@ class ResearchTests(unittest.IsolatedAsyncioTestCase):
         result = aggregate([one["result"], two], self.exp.splits["health"]["dev"], "skill")
         self.assertAlmostEqual(result["mean"], .3)
 
-    async def test_malformed_and_duplicate_proposals_are_rejected(self):
+    async def test_malformed_and_duplicate_submissions_are_rejected(self):
         await self.exp.evaluate_candidate("health", "seed")
         self.exp.select()
-        async def bad(prompt, directory):
-            return {"analysis": "bad", "candidates": [
-                {"parent_id": "seed", "skill_md": skill(.2), "hypothesis": "same"},
-                {"parent_id": "seed", "skill_md": "no frontmatter", "hypothesis": "invalid"}]}
-        self.exp.proposer.propose = bad
-        ids = await self.exp.propose("health", 1)
-        for cid in ids:
-            self.assertEqual(self.exp.state["candidates"]["health"][cid]["status"], "rejected")
+        bridge = ResearchTools(self.exp, "health")
+        bridge.generation, bridge.allowance = 1, 2
+        for content in (skill(.2), "no frontmatter"):
+            with self.assertRaises(ValueError):
+                bridge.submit_candidate("bad", "seed", "invalid", content)
+        self.assertEqual(list(bridge.records), ["seed"])
+        self.assertFalse(self.exp.jobs["health"])
 
     def test_feedback_cannot_read_outside_suite_or_holdout(self):
         directory = self.exp.root / "feedback"
@@ -390,35 +398,6 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(RuntimeError):
             await evaluate._gather_cancel_on_error(sibling(), failed())
         self.assertTrue(stopped.is_set())
-
-    async def test_responses_request_model_structured_output_and_retry(self):
-        with tempfile.TemporaryDirectory() as directory:
-            cfg = fixture(Path(directory))
-            reserved = []
-            def reserve():
-                reserved.append(1)
-                return len(reserved)
-            def handler(request):
-                body = json.loads(request.content)
-                self.assertEqual(body["model"], "gpt-6-astra")
-                self.assertEqual(body["text"]["format"]["type"], "json_schema")
-                self.assertFalse(body["store"])
-                if len(reserved) == 1:
-                    return httpx.Response(429, headers={"retry-after": "0"})
-                proposal = {"analysis": "analysis", "candidates": [
-                    {"parent_id": "seed", "hypothesis": "hypothesis", "skill_md": skill(.3)} for _ in range(2)]}
-                return httpx.Response(200, json={"id": "test", "status": "completed", "usage": {"total_tokens": 40},
-                    "output": [{"type": "message", "content": [{"type": "output_text", "text": json.dumps(proposal)}]}]})
-            client = httpx.AsyncClient
-            def factory(**kwargs):
-                return client(transport=httpx.MockTransport(handler), **kwargs)
-            with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}), \
-                 patch("skilltrainbench.research.optimizer.httpx.AsyncClient", factory), \
-                 patch("skilltrainbench.research.optimizer.asyncio.sleep", AsyncMock()):
-                result = await Astra(cfg, reserve).propose({}, Path(directory) / "api")
-            self.assertEqual(len(result["candidates"]), 2)
-            self.assertEqual(len(reserved), 2)
-            self.assertNotIn("test-key", (Path(directory) / "api/request.json").read_text())
 
     def test_default_config_loads(self):
         cfg = load_settings(Path(__file__).resolve().parents[1] / "autoresearch.toml")

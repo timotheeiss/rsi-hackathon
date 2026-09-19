@@ -24,6 +24,7 @@ class Settings:
     generations: int = 10
     candidates_per_domain: int = 5
     max_inflight_candidates_per_domain: int = 5
+    researcher_max_turns: int = 12
     keep_top: int = 3
     max_parallel_suites: int = 5
     tasks_per_suite: int = 2
@@ -31,7 +32,7 @@ class Settings:
     repeats: int = 1
     seed: int = 42
     max_evaluations: int = 120
-    max_optimizer_calls: int = 40
+    max_optimizer_calls: int = 240
     suite_timeout_seconds: int = 14400
     max_hours: float = 12
     min_improvement: float = 0.001
@@ -63,7 +64,7 @@ def load_settings(path: str | Path) -> Settings:
     if not domains or not set(domains) <= {"health", "hle"}:
         raise ValueError("research domains must include health and/or hle")
     cfg = Settings(root, contract, output, domains, **run)
-    positive = ("candidates_per_domain", "max_inflight_candidates_per_domain", "keep_top", "max_parallel_suites", "tasks_per_suite",
+    positive = ("candidates_per_domain", "max_inflight_candidates_per_domain", "researcher_max_turns", "keep_top", "max_parallel_suites", "tasks_per_suite",
                 "max_task_containers", "repeats", "max_evaluations", "max_optimizer_calls",
                 "suite_timeout_seconds", "feedback_examples", "max_skill_chars", "max_output_tokens")
     if any(type(getattr(cfg, k)) is not int or getattr(cfg, k) < 1 for k in positive):

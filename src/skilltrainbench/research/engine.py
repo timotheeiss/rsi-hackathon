@@ -9,8 +9,8 @@ from pathlib import Path
 
 from .. import evaluate
 from ..config import check_skill, load_config
-from .feedback import SCORING, aggregate, complete_scores, feedback
-from .optimizer import Astra
+from .feedback import SCORING, aggregate, complete_scores
+from .optimizer import AstraResearcher
 from .settings import Settings
 from .storage import digest, manifest, read_json, tree_digest, write_json
 from .usage import summarize_usage
@@ -21,7 +21,7 @@ class StopResearch(RuntimeError):
 
 
 class Experiment:
-    def __init__(self, cfg: Settings, evaluator=None, proposer=None):
+    def __init__(self, cfg: Settings, evaluator=None, researcher_factory=None):
         self.cfg = cfg
         self.contract = load_config(cfg.contract)
         self.root = cfg.output
@@ -34,9 +34,8 @@ class Experiment:
         }
         self.suite_slots = asyncio.Semaphore(cfg.max_parallel_suites)
         self.task_slots = asyncio.Semaphore(cfg.max_task_containers)
-        # Separate curators, prompts and histories; only admission counters are shared.
-        self.proposers = {d: proposer or Astra(cfg, self.reserve_call) for d in cfg.domains}
-        self.proposer = proposer  # Optional injected test proposer.
+        self.researcher_factory = researcher_factory or AstraResearcher
+        self.jobs = {d: {} for d in cfg.domains}
         self.state.setdefault("agents", {d: {"generation": self.state["generation"],
                                             "proposed_generation": self.state["generation"], "status": "pending"}
                                           for d in cfg.domains})
@@ -84,7 +83,7 @@ class Experiment:
     def skill_dir(self, domain, candidate):
         return self.root / "candidates" / domain / candidate / "skill"
 
-    def register(self, domain, candidate, parent_path, skill_md, hypothesis, generation, parent_id=None):
+    def register(self, domain, candidate, parent_path, skill_md, hypothesis, generation, parent_id=None, **metadata):
         target = self.skill_dir(domain, candidate)
         # Only an unregistered staging directory can exist after an interrupted copy.
         if target.exists():
@@ -96,7 +95,7 @@ class Experiment:
         if not check["ok"] or (skill_md is not None and check["warnings"]):
             raise ValueError(f"candidate failed skill validation: {check}")
         record = {"id": candidate, "parent": parent_id, "generation": generation,
-                  "hypothesis": hypothesis, "sha256": tree_digest(target), "status": "pending"}
+                  "hypothesis": hypothesis, "sha256": tree_digest(target), "status": "pending", **metadata}
         self.state["candidates"][domain][candidate] = record
         self.save()
         return record
@@ -253,34 +252,14 @@ class Experiment:
         write_json(self.root / "usage.json", summarize_usage(self.root))
         (self.root / "report.md").write_text("\n".join(lines))
 
-    def prompt(self, domain, generation, count=None):
-        ranked = self.ranked(domain)
-        champion = self.state["champions"][domain]
-        parents = list(dict.fromkeys([champion] + [c["id"] for c in ranked]))[:self.cfg.keep_top]
-        records = self.state["candidates"][domain]
-        # Include recent losers as well as the incumbent, so failed hypotheses inform the next wave.
-        recent = sorted(records.values(), key=lambda c: (c["generation"], c["id"]), reverse=True)
-        evidence_ids = list(dict.fromkeys([champion] + [c["id"] for c in recent[:self.cfg.candidates_per_domain]]))
-        evidence = []
-        for cid in evidence_ids:
-            c = records[cid]
-            evidence.append({"candidate": cid, "hypothesis": c["hypothesis"], "status": c["status"],
-                             "scores": c.get("scores"), "examples": feedback(
-                                 self.contract, domain, self.splits[domain]["dev"],
-                                 [self.root / p for p in c.get("suites", [])], self.cfg.feedback_examples)})
-        return {"domain": domain, "generation": generation, "scoring": SCORING[domain],
-                "objective": "Maximize mean raw skill reward on the fixed development tasks. Cached placebo "
-                "is shared by all candidates, so ranking by reward is equivalent to ranking by lift. "
-                "The unseen local holdout is only evaluated after optimization is sealed.",
+    def research_brief(self, domain):
+        return {"domain": domain, "scoring": SCORING[domain],
+                "objective": "Maximize mean raw skill reward on the fixed development tasks. "
+                "Controls are cached; holdout evaluation is separate and unavailable to researchers.",
                 "contract": (self.root / "hackathon.snapshot.toml").read_text(),
                 "grader_source": self.grader_source(domain),
-                "count": count or self.cfg.candidates_per_domain, "max_skill_chars": self.cfg.max_skill_chars,
-                "parents": [{"id": cid, "skill_md": (self.skill_dir(domain, cid) / "SKILL.md").read_text(),
-                             "supporting_files": [str(p.relative_to(self.skill_dir(domain, cid)))
-                                                  for p in self.skill_dir(domain, cid).rglob("*") if p.is_file()]}
-                            for cid in parents],
-                "history": [{k: c.get(k) for k in ("id", "parent", "hypothesis", "status", "scores")}
-                            for c in recent[:30]], "evidence": evidence}
+                "development_tasks": self.splits[domain]["dev"],
+                "max_skill_chars": self.cfg.max_skill_chars}
 
     def grader_source(self, domain):
         task = self.contract.domain(domain).dataset_dir / self.splits[domain]["dev"][0]
@@ -295,44 +274,62 @@ class Experiment:
         return "\n\n".join(ast.get_source_segment(source, node) for node in ast.parse(source).body
                            if isinstance(node, ast.FunctionDef) and node.name == "calculate_score")
 
-    async def propose(self, domain, generation, count=None):
-        directory = self.root / "optimizer" / domain / f"generation-{generation:04d}"
-        path = directory / "proposal.json"
-        context_path = directory / "context.json"
-        prompt = read_json(context_path) if context_path.exists() else self.prompt(domain, generation, count)
-        write_json(context_path, prompt)
-        self.event("optimizer_started", domain=domain, generation=generation, count=prompt["count"])
-        proposal = read_json(path) if path.exists() else await self.proposers[domain].propose(prompt, directory)
-        write_json(path, proposal)
-        parents = {p["id"] for p in prompt["parents"]}
-        candidates = []
-        for index, item in enumerate(proposal["candidates"]):
-            cid = f"g{generation:04d}-c{index + 1:02d}"
-            candidates.append(cid)
-            records = self.state["candidates"][domain]
-            if cid in records:
-                continue
-            try:
-                parent = item["parent_id"]
-                text = item["skill_md"]
-                if parent not in parents:
-                    raise ValueError("parent is not a retained candidate")
-                if not text.strip() or len(text) > self.cfg.max_skill_chars:
-                    raise ValueError("skill is empty or exceeds max_skill_chars")
-                if any(name in text for names in self.splits[domain].values() for name in names):
-                    raise ValueError("skill contains a benchmark task identifier")
-                if any((self.skill_dir(domain, c) / "SKILL.md").read_text() == text
-                       for c, record in records.items() if record["status"] != "rejected"):
-                    raise ValueError("duplicate skill")
-                self.register(domain, cid, self.skill_dir(domain, parent), text,
-                              item["hypothesis"], generation, parent)
-            except (ValueError, KeyError, TypeError) as error:
-                records[cid] = {"id": cid, "generation": generation, "status": "rejected",
-                                "hypothesis": str(item.get("hypothesis", "")), "reason": str(error)}
-                self.save()
-                self.event("candidate_rejected", domain=domain, candidate=cid, reason=str(error))
-        self.event("optimizer_complete", domain=domain, generation=generation, candidates=len(candidates))
-        return candidates
+    def submit_candidate(self, domain, generation, allowance, submission_key, parent_id, hypothesis, skill_md):
+        """Durably register then queue a job, without waiting for any benchmark results."""
+        self.check_stop()
+        if self.state["sealed"]:
+            raise ValueError("experiment is sealed")
+        records = self.state["candidates"][domain]
+        if not submission_key.strip() or len(submission_key) > 100:
+            raise ValueError("submission_key must contain 1–100 characters")
+        # Tool replay after an interrupted SDK run must not launch a second paid suite.
+        request_hash = digest(json.dumps([parent_id, hypothesis, skill_md]).encode())
+        previous = next((c for c in records.values() if c.get("submission_key") == submission_key
+                         and c["generation"] == generation), None)
+        if previous:
+            if previous["request_sha256"] != request_hash:
+                raise ValueError("submission_key already used with different content")
+            return self.job_receipt(domain, previous["id"])
+        members = [c for c in records.values() if c["generation"] == generation]
+        if len(members) >= min(allowance, self.cfg.candidates_per_domain):
+            raise ValueError("this research round has used its candidate allowance")
+        if sum(c["status"] == "pending" for c in records.values()) >= self.cfg.max_inflight_candidates_per_domain:
+            raise ValueError("candidate pool is full; inspect running jobs and finish this research turn")
+        reserve = 2 * len(self.cfg.domains) * self.cfg.repeats
+        if self.state["evaluations_started"] >= self.cfg.max_evaluations - reserve:
+            raise StopResearch("evaluation limit reached (final holdout slots are reserved)")
+        parents = {c["id"] for c in self.ranked(domain)[:self.cfg.keep_top]}
+        parents.add(self.state["champions"].get(domain))
+        if parent_id not in parents:
+            raise ValueError("parent must be a retained, completely evaluated candidate in this domain")
+        if not skill_md.strip() or len(skill_md) > self.cfg.max_skill_chars:
+            raise ValueError("skill is empty or exceeds max_skill_chars")
+        if not hypothesis.strip() or len(hypothesis) > 4000:
+            raise ValueError("hypothesis must contain 1–4000 characters")
+        if any(name in skill_md for names in self.splits[domain].values() for name in names):
+            raise ValueError("skill contains a benchmark task identifier")
+        if any((self.skill_dir(domain, cid) / "SKILL.md").read_text() == skill_md
+               for cid, c in records.items() if c["status"] != "rejected"):
+            raise ValueError("duplicate skill; inspect the existing experiment instead")
+        cid = f"g{generation:04d}-c{len(members) + 1:02d}"
+        try:
+            record = self.register(domain, cid, self.skill_dir(domain, parent_id), skill_md,
+                                   hypothesis, generation, parent_id,
+                                   submission_key=submission_key, request_sha256=request_hash)
+        except ValueError:
+            shutil.rmtree(self.skill_dir(domain, cid), ignore_errors=True)
+            raise
+        self.start_candidate(domain, cid)
+        self.event("candidate_submitted", domain=domain, candidate=cid, generation=generation)
+        return self.job_receipt(domain, record["id"])
+
+    def job_receipt(self, domain, candidate):
+        return {"accepted": True, "job_id": f"{domain}/{candidate}", "candidate_id": candidate,
+                "status": self.state["candidates"][domain][candidate]["status"]}
+
+    def start_candidate(self, domain, candidate):
+        if candidate not in self.jobs[domain]:
+            self.jobs[domain][candidate] = asyncio.create_task(self.evaluate_and_select(domain, candidate))
 
     async def evaluate_controls(self, domain):
         # Cache each domain independently; a slow HLE suite never blocks Health.
@@ -370,63 +367,66 @@ class Experiment:
         self.checkpoint_agent(domain)
 
     async def search_domain(self, domain):
-        """Refill a bounded pool as results arrive, with one proposal call per curator."""
+        """Run an SDK researcher alongside its bounded, independently completing jobs."""
         agent = self.state["agents"][domain]
         records = self.state["candidates"][domain]
-        pending = [cid for cid, c in records.items()
-                   if cid != "seed" and c["status"] == "pending"
-                   and c["generation"] <= agent["proposed_generation"]]
-        running = {}
-        proposal = None
-        proposal_generation = None
+        jobs = self.jobs[domain]
+        researcher = self.researcher_factory(self, domain)
+        pending = [cid for cid, c in records.items() if cid != "seed" and c["status"] == "pending"]
+        research = None
         try:
             while True:
-                while pending and len(running) < self.cfg.max_inflight_candidates_per_domain:
-                    cid = pending.pop(0)
-                    task = asyncio.create_task(self.evaluate_and_select(domain, cid))
-                    running[task] = cid
+                for cid, task in list(jobs.items()):
+                    if task.done():
+                        del jobs[cid]
+                        task.result()
+                while pending and len(jobs) < self.cfg.max_inflight_candidates_per_domain:
+                    self.start_candidate(domain, pending.pop(0))
                 self.checkpoint_agent(domain)
-                vacancies = self.cfg.max_inflight_candidates_per_domain - len(running)
+                vacancies = self.cfg.max_inflight_candidates_per_domain - len(jobs)
                 terminal_count = sum(c["status"] in {"complete", "failed", "rejected"} for c in records.values())
                 more_rounds = not self.cfg.generations or agent["proposed_generation"] < self.cfg.generations
-                # Wait for fresh evidence before proposing again if the previous batch
-                # left room. Failed/rejected candidates also count as useful feedback.
                 fresh = terminal_count != agent.get("proposal_feedback_count", -1)
-                if proposal is None and not pending and vacancies and more_rounds and (fresh or not running):
+                resume_round = "active_generation" in agent
+                if research is None and not pending and more_rounds and (
+                        resume_round or (vacancies and (fresh or not jobs))):
                     self.check_stop()
-                    proposal_generation = agent["proposed_generation"] + 1
+                    agent.setdefault("active_generation", agent["proposed_generation"] + 1)
+                    agent.setdefault("active_allowance", min(vacancies, self.cfg.candidates_per_domain))
                     agent["proposal_feedback_count"] = terminal_count
                     self.save()
-                    proposal = asyncio.create_task(self.propose(
-                        domain, proposal_generation, min(vacancies, self.cfg.candidates_per_domain)))
-                waiting = set(running)
-                if proposal is not None:
-                    waiting.add(proposal)
+                    research = asyncio.create_task(researcher.investigate(
+                        agent["active_generation"], agent["active_allowance"]))
+                waiting = set(jobs.values())
+                if research is not None:
+                    waiting.add(research)
                 if not waiting:
                     return
                 done, _ = await asyncio.wait(waiting, return_when=asyncio.FIRST_COMPLETED)
-                # Candidate tasks publish their scores immediately; even when both finish
-                # together the next proposal sees all newly completed evidence.
-                for task in done - {proposal}:
-                    del running[task]
-                    task.result()
-                if proposal is not None and proposal in done:
-                    ids = proposal.result()
-                    agent["proposed_generation"] = proposal_generation
+                if research is not None and research in done:
+                    research.result()
+                    agent["proposed_generation"] = agent.pop("active_generation")
+                    agent.pop("active_allowance")
                     self.save()
-                    pending.extend(cid for cid in ids if records[cid]["status"] == "pending")
-                    proposal = None
+                    research = None
         except asyncio.CancelledError:
-            tasks = [*running, *([proposal] if proposal else [])]
+            tasks = [*jobs.values(), *([research] if research else [])]
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             raise
         except Exception:
-            # A budget stop or curator error drains already-admitted work, saving winners.
-            await asyncio.gather(*running, *([proposal] if proposal else []), return_exceptions=True)
+            # Stop further submissions before draining jobs, including jobs the SDK
+            # could otherwise submit while the error handler is awaiting cleanup.
+            if research is not None and not research.done():
+                research.cancel()
+            if research is not None:
+                await asyncio.gather(research, return_exceptions=True)
+            await asyncio.gather(*jobs.values(), return_exceptions=True)
             self.checkpoint_agent(domain)
             raise
+        finally:
+            await researcher.close()
 
     async def run_domain(self, domain):
         agent = self.state["agents"][domain]
