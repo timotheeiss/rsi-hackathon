@@ -61,7 +61,7 @@ def _run(args) -> int:
             if args.data_cmd != "pull":
                 print("usage: stbench data pull")
                 return 2
-            root = config.pull_data(hcfg, token=os.environ.get("HF_TOKEN"))
+            root = config.pull_data(hcfg, token=os.environ.get("HF_TOKEN") or None)
             for name, domain in hcfg.domains.items():
                 if domain.dataset_dir.is_dir():
                     print(f"{name}: {len(config.task_names(domain))} tasks in {domain.dataset_dir}")

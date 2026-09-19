@@ -571,6 +571,14 @@ def _listen(host: str, port: int) -> socket.socket:
     return sock
 
 
+class _EmbeddedServer(uvicorn.Server):
+    @contextmanager
+    def capture_signals(self):
+        # The calling asyncio application owns shutdown. Concurrent gateways must
+        # not overwrite each other's SIGINT/SIGTERM handlers.
+        yield
+
+
 class LocalGatewayServer:
     """Serves a gateway app on host loopback and at an address task containers
     can reach: `host.docker.internal` on Docker Desktop (macOS/Windows), the
@@ -606,7 +614,7 @@ class LocalGatewayServer:
         # "Server disconnected without sending a response".
         config = uvicorn.Config(self._app, host="127.0.0.1", port=self.port, log_level="warning",
                                 access_log=False, lifespan="off", timeout_keep_alive=3600)
-        self._server = uvicorn.Server(config)
+        self._server = _EmbeddedServer(config)
         self._task = asyncio.create_task(self._server.serve(sockets=self._socks))
         for _ in range(400):
             if self._server.started:

@@ -1,0 +1,25 @@
+# A real, paid plumbing check: two dev + two holdout tasks per domain, one wave.
+[research]
+contract = "hackathon.toml"
+output = "runs/autoresearch-smoke"
+generations = 1
+candidates_per_domain = 1
+max_inflight_candidates_per_domain = 1
+keep_top = 1
+max_parallel_suites = 2
+tasks_per_suite = 1
+max_task_containers = 2
+max_evaluations = 12
+max_optimizer_calls = 6
+max_output_tokens = 12000
+max_hours = 4
+
+[domains.health]
+skill = "submissions/aditya-tim/health"
+dev_size = 2
+holdout_size = 2
+
+[domains.hle]
+skill = "submissions/aditya-tim/hle"
+dev_size = 2
+holdout_size = 2

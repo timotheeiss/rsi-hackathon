@@ -14,6 +14,7 @@ dependencies = [
 
 [project.scripts]
 stbench = "skilltrainbench.cli:main"
+stbench-research = "skilltrainbench.research.cli:main"
 
 [build-system]
 requires = ["hatchling"]

@@ -1,0 +1,33 @@
+# Laptop preset: same development/holdout tasks as the EC2 configuration,
+# with two task containers and a shorter search. No paid calls until `run`.
+[research]
+contract = "hackathon.toml"
+output = "runs/autoresearch-local"
+optimizer_model = "gpt-6-astra"
+reasoning_effort = "high"
+max_output_tokens = 24000
+generations = 3
+candidates_per_domain = 2
+keep_top = 3
+max_parallel_suites = 2
+tasks_per_suite = 1
+max_task_containers = 2
+repeats = 1
+seed = 42
+min_improvement = 0.001
+max_evaluations = 24
+max_optimizer_calls = 18
+suite_timeout_seconds = 14400
+max_hours = 12
+feedback_examples = 6
+max_skill_chars = 24000
+
+[domains.health]
+skill = "submissions/aditya-tim/health"
+dev_file = "research/splits/health-dev.txt"
+holdout_file = "research/splits/health-holdout.txt"
+
+[domains.hle]
+skill = "submissions/aditya-tim/hle"
+dev_size = 24
+holdout_size = 24

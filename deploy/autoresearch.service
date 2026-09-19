@@ -1,0 +1,25 @@
+[Unit]
+Description=Health and HLE skill autoresearch
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+SupplementaryGroups=docker
+WorkingDirectory=/home/ubuntu/rsi-hackathon
+Environment=PATH=/home/ubuntu/rsi-hackathon/.venv/bin:/home/ubuntu/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONUNBUFFERED=1
+# .env is read by the application. Do not embed credentials in this service.
+ExecStart=/home/ubuntu/rsi-hackathon/.venv/bin/stbench-research run --config autoresearch.toml
+# Manual restart avoids repeated billed retries of a persistent failure.
+Restart=no
+KillSignal=SIGTERM
+KillMode=control-group
+TimeoutStopSec=120
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

@@ -4,6 +4,7 @@ __pycache__/
 .DS_Store
 
 # Credentials
+*.pem
 .env
 .env.*
 !.env_example

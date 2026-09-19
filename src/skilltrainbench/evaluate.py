@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import secrets
+from contextlib import AsyncExitStack
 from pathlib import Path
 
 import httpx
@@ -37,7 +38,8 @@ def write_placebo(placebo_dir: Path) -> Path:
 
 
 async def _attempt_with_retries(task: Task, skill_dir: Path | None, sem: asyncio.Semaphore, *,
-                                registry: AttemptTagRegistry | None, tags: dict, **run_kw) -> dict:
+                                registry: AttemptTagRegistry | None, tags: dict,
+                                task_semaphore: asyncio.Semaphore | None = None, **run_kw) -> dict:
     """One scored attempt; retries infrastructure failures, never a wrong answer."""
     judged = task.benchmark == "healthbench"
     for n, delay in enumerate((0.0, *_RETRY_DELAYS)):
@@ -49,7 +51,10 @@ async def _attempt_with_retries(task: Task, skill_dir: Path | None, sem: asyncio
             registration.__enter__()
         try:
             async with sem:
-                attempt = await harbor.run_attempt(task, skill_dir, attempt_id=attempt_id, **run_kw)
+                async with AsyncExitStack() as stack:
+                    if task_semaphore is not None:
+                        await stack.enter_async_context(task_semaphore)
+                    attempt = await harbor.run_attempt(task, skill_dir, attempt_id=attempt_id, **run_kw)
         finally:
             if registration is not None:
                 registration.__exit__(None, None, None)
@@ -64,7 +69,8 @@ async def _attempt_with_retries(task: Task, skill_dir: Path | None, sem: asyncio
 
 async def run_eval(cfg: HackathonCfg, domain_name: str, *, skill_dir: str | Path | None, out: str | Path,
                    arms: list[str], task_ids: list[str] | None = None, limit: int | None = None,
-                   upstream_base_url: str, upstream_key: str | None, concurrency: int | None = None) -> dict:
+                   upstream_base_url: str, upstream_key: str | None, concurrency: int | None = None,
+                   task_semaphore: asyncio.Semaphore | None = None) -> dict:
     domain = cfg.domain(domain_name)
     if not arms or any(a not in ARMS for a in arms):
         raise ValueError(f"arms must be drawn from {ARMS}, got {arms}")
@@ -82,22 +88,30 @@ async def run_eval(cfg: HackathonCfg, domain_name: str, *, skill_dir: str | Path
 
     headers = {"authorization": f"Bearer {upstream_key}"} if upstream_key else {}
     upstream = httpx.AsyncClient(base_url=upstream_base_url, headers=headers, timeout=600.0)
-    prices = await fetch_prices(upstream)
+    resources = AsyncExitStack()
+    await resources.enter_async_context(upstream)
     learner_meter, learner_ledger = BudgetMeter(domain.eval_budget_tokens), Ledger()
-    learner_gw = await LocalGatewayServer(build_app(learner_meter, client=upstream, ledger=learner_ledger,
-                                                    prices=prices)).start()
-    needs_aux = domain.benchmark != "qfbench"
     aux_meter = aux_ledger = aux_registry = aux_key = aux_gw = aux_exhausted = None
-    if needs_aux:
-        aux_meter, aux_ledger, aux_registry = BudgetMeter(domain.judge_budget_tokens), Ledger(), AttemptTagRegistry()
-        aux_key = secrets.token_urlsafe(32)
-        aux_app = build_app(aux_meter, client=upstream, ledger=aux_ledger, virtual_key=aux_key,
-                            attempt_registry=aux_registry, prices=prices)
-        aux_gw = await LocalGatewayServer(aux_app).start()
-        if domain.benchmark == "healthbench":
-            aux_exhausted = lambda: bool(aux_app.state.budget_rejected)  # noqa: E731
-        else:
-            aux_exhausted = aux_meter.exhausted
+    try:
+        prices = await fetch_prices(upstream)
+        learner_gw = LocalGatewayServer(build_app(learner_meter, client=upstream, ledger=learner_ledger, prices=prices))
+        resources.push_async_callback(learner_gw.stop)
+        await learner_gw.start()
+        if domain.benchmark != "qfbench":
+            aux_meter, aux_ledger, aux_registry = BudgetMeter(domain.judge_budget_tokens), Ledger(), AttemptTagRegistry()
+            aux_key = secrets.token_urlsafe(32)
+            aux_app = build_app(aux_meter, client=upstream, ledger=aux_ledger, virtual_key=aux_key,
+                                attempt_registry=aux_registry, prices=prices)
+            aux_gw = LocalGatewayServer(aux_app)
+            resources.push_async_callback(aux_gw.stop)
+            await aux_gw.start()
+            if domain.benchmark == "healthbench":
+                aux_exhausted = lambda: bool(aux_app.state.budget_rejected)  # noqa: E731
+            else:
+                aux_exhausted = aux_meter.exhausted
+    except BaseException:
+        await resources.aclose()
+        raise
 
     sem = asyncio.Semaphore(concurrency or cfg.concurrency)
     rows: list[dict] = []
@@ -107,6 +121,7 @@ async def run_eval(cfg: HackathonCfg, domain_name: str, *, skill_dir: str | Path
             attempt = await _attempt_with_retries(
                 task, arm_dirs[arm], sem,
                 registry=aux_registry, tags={"phase": "eval", "arm": arm, "task_id": task.id},
+                task_semaphore=task_semaphore,
                 settings=settings, gateway_url=learner_gw.container_url, gateway_key="stbench-no-secret",
                 jobs_dir=out / "harbor-jobs",
                 aux_url=aux_gw.container_url if aux_gw else None, aux_key=aux_key,
@@ -130,19 +145,16 @@ async def run_eval(cfg: HackathonCfg, domain_name: str, *, skill_dir: str | Path
         return value
 
     async def _task(task: Task) -> Pair:
-        results = await asyncio.gather(*[_arm(task, arm) for arm in arms])
+        results = await _gather_cancel_on_error(*[_arm(task, arm) for arm in arms])
         by_arm = dict(zip(arms, results))
         return Pair(task_id=task.id, seed=0, baseline=by_arm.get("baseline"), placebo=by_arm.get("placebo"),
                     skill=by_arm.get("skill"), domain=task.benchmark,
                     invalidated=frozenset(a for a in arms if by_arm[a] is None))
 
     try:
-        pairs = await asyncio.gather(*[_task(t) for t in tasks])
+        pairs = await _gather_cancel_on_error(*[_task(t) for t in tasks])
     finally:
-        await learner_gw.stop()
-        if aux_gw is not None:
-            await aux_gw.stop()
-        await upstream.aclose()
+        await resources.aclose()
         (out / "learner_ledger.jsonl").write_text(learner_ledger.to_jsonl())
         if aux_ledger is not None:
             (out / "grader_ledger.jsonl").write_text(aux_ledger.to_jsonl())
@@ -167,6 +179,18 @@ async def run_eval(cfg: HackathonCfg, domain_name: str, *, skill_dir: str | Path
     }
     (out / "eval_result.json").write_text(json.dumps(result, indent=2, default=str), encoding="utf-8")
     return result
+
+
+async def _gather_cancel_on_error(*coroutines):
+    """Drain sibling attempts before shutting down their gateways on any failure."""
+    pending = [asyncio.create_task(c) for c in coroutines]
+    try:
+        return await asyncio.gather(*pending)
+    except BaseException:
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        raise
 
 
 def format_result(result: dict) -> str:

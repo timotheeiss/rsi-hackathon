@@ -1,5 +1,9 @@
 # Skill-writing hackathon
 
+**Autonomous Health/HLE skill optimization:** see [the autoresearch guide](docs/autoresearch.md)
+for the GPT-6 Astra harness, parallel benchmark suites, resumable experiments, API key
+setup, and EC2 deployment. Start with `uv run stbench-research plan` (no API calls).
+
 You are the curator. Write a **skill** (a folder with a `SKILL.md` plus any
 supporting files) that makes a fixed **learner** model better at a domain. The
 learner never changes; only your skill does. Your skill is scored on held-out
