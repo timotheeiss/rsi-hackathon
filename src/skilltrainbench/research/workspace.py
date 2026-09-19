@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import stat
+import time
 import uuid
 from pathlib import Path
 
@@ -197,6 +198,8 @@ class ResearchWorkspace:
                                                     request["parent_id"], request["hypothesis"], text)
             except (ValueError, OSError, KeyError) as error:
                 result = {"accepted": False, "error": redact(str(error))[:2000]}
+                self.exp.event("candidate_rejected", domain=self.domain, generation=self.generation,
+                               submission=name, reason=result["error"], receipt=str(receipt))
             write_json(receipt, result)
 
     async def watch(self):
@@ -208,15 +211,18 @@ class ResearchWorkspace:
     async def start(self):
         if self.started:
             return
+        self.exp.event("research_workspace_starting", domain=self.domain, workspace=str(self.work))
         self.prepare()
         async with self.exp.research_image_lock:
             code, _, _ = await command_output("docker", "image", "inspect", self.exp.cfg.researcher_image)
             if code:
                 dockerfile = Path(__file__).with_name("researcher.Dockerfile")
+                self.exp.event("research_image_build_started", domain=self.domain, image=self.exp.cfg.researcher_image)
                 code, _, stderr = await command_output("docker", "build", "-t", self.exp.cfg.researcher_image,
                                                        "-f", str(dockerfile), str(dockerfile.parent), timeout=600)
                 if code:
                     raise RuntimeError(f"researcher image build failed: {stderr[-2000:]}")
+                self.exp.event("research_image_build_complete", domain=self.domain, image=self.exp.cfg.researcher_image)
         args = ["docker", "run", "-d", "--init", "--name", self.container, "--network", "none",
                 "--cpus", "1", "--memory", "2g", "--pids-limit", "128", "--cap-drop", "ALL",
                 "--security-opt", "no-new-privileges", "--read-only", "--tmpfs", "/tmp:rw,size=256m",
@@ -229,6 +235,7 @@ class ResearchWorkspace:
             if code:
                 raise RuntimeError(f"researcher container failed to start: {stderr[-2000:]}")
             self.started = True
+            self.exp.event("research_workspace_ready", domain=self.domain, container=self.container)
         except BaseException:
             await command_output("docker", "rm", "-f", self.container)
             raise
@@ -238,6 +245,9 @@ class ResearchWorkspace:
         action = request.data.action
         timeout = min(120, max(1, (action.timeout_ms or 60000) / 1000))
         limit = min(20000, max(1000, action.max_output_length or 12000))
+        started_at = time.monotonic()
+        self.exp.event("research_shell_started", domain=self.domain, generation=self.generation,
+                       commands=min(20, len(action.commands)))
         outputs = []
         for cmd in action.commands[:20]:
             try:
@@ -251,7 +261,10 @@ class ResearchWorkspace:
             outputs.append(ShellCommandOutput(stdout=redact(stdout), stderr=redact(stderr), outcome=outcome, command=cmd))
         self.collect_submissions()
         self.refresh()
-        self.exp.event("research_shell", domain=self.domain, commands=len(outputs))
+        self.exp.event("research_shell", domain=self.domain, generation=self.generation, commands=len(outputs),
+                       elapsed_seconds=round(time.monotonic() - started_at, 2),
+                       outcomes=[{"type": output.outcome.type, "exit_code": output.outcome.exit_code}
+                                 for output in outputs])
         return ShellResult(output=outputs, max_output_length=limit)
 
     async def close(self):

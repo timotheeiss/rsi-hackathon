@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .. import evaluate
@@ -41,16 +42,37 @@ class Experiment:
                                             "proposed_generation": self.state["generation"], "status": "pending"}
                                           for d in cfg.domains})
         self.active_suites = set()
+        self.queued_suites = set()
         self.finalizing = False
 
     def save(self):
         write_json(self.state_path, self.state)
 
     def event(self, kind, **fields):
-        record = {"time": time.time(), "event": kind, **fields}
+        def clean(value):
+            if isinstance(value, str):
+                return redact(value)
+            if isinstance(value, dict):
+                return {k: clean(v) for k, v in value.items()}
+            if isinstance(value, (list, tuple)):
+                return [clean(v) for v in value]
+            return value
+
+        fields = clean(fields)
+        now = time.time()
+        timestamp = datetime.fromtimestamp(now, timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+        record = {"time": now, "timestamp": timestamp, "event": kind, **fields}
         with (self.root / "events.jsonl").open("a") as stream:
             stream.write(json.dumps(record, ensure_ascii=False) + "\n")
-        print(f"[{kind}] " + " ".join(f"{k}={v}" for k, v in fields.items()), flush=True)
+        # Keep one bounded line per event, even for multiline model-authored hypotheses.
+        def display(value):
+            if isinstance(value, str) and len(value) > 300:
+                value = value[:297] + "..."
+            if isinstance(value, str) and value and all(c.isalnum() or c in "_./:-" for c in value):
+                return value
+            return json.dumps(value, ensure_ascii=True)
+
+        print(f"{timestamp} [{kind}] " + " ".join(f"{k}={display(v)}" for k, v in fields.items()), flush=True)
 
     def initialize(self):
         self.root.mkdir(parents=True, exist_ok=True)
@@ -125,6 +147,7 @@ class Experiment:
         directory = self.root / "evaluations" / domain / label
         status_path = directory / "suite.json"
         names = self.splits[domain][split]
+        details = {"domain": domain, "suite": label, "candidate": candidate, "split": split, "arms": arms}
         identity = {"domain": domain, "candidate": candidate, "split": split, "arms": arms, "tasks": names,
                     "skill_sha256": self.state["candidates"][domain][candidate]["sha256"] if candidate else None}
         previous = read_json(status_path) if status_path.exists() else {}
@@ -136,8 +159,17 @@ class Experiment:
                 raise ValueError(f"cached result changed: {result_path}")
             result = read_json(result_path)
             complete_scores(result, names, arms)
+            self.event("suite_cached", **details, result=str(result_path))
             return {"result": result, "directory": str(result_path.parent.relative_to(self.root))}
-        async with self.suite_slots:
+        queued_at = time.monotonic()
+        suite_id = f"{domain}/{label}"
+        self.queued_suites.add(suite_id)
+        self.event("suite_queued", **details, tasks=len(names), task_attempts=len(names) * len(arms))
+        try:
+            await self.suite_slots.acquire()
+        finally:
+            self.queued_suites.discard(suite_id)
+        try:
             self.check_stop()
             reserve = 0 if self.finalizing else 2 * len(self.cfg.domains) * self.cfg.repeats
             if self.state["evaluations_started"] >= self.cfg.max_evaluations - reserve:
@@ -148,8 +180,12 @@ class Experiment:
             out = directory / attempt
             record = {"identity": identity, "attempt": attempt, "status": "running"}
             write_json(status_path, record)
-            self.event("suite_started", domain=domain, suite=label, count=self.state["evaluations_started"])
-            self.active_suites.add(f"{domain}/{label}")
+            started_at = time.monotonic()
+            self.active_suites.add(suite_id)
+            self.event("suite_started", **details, count=self.state["evaluations_started"],
+                       tasks=len(names), task_attempts=len(names) * len(arms),
+                       queued_seconds=round(started_at - queued_at, 2),
+                       active_suites=len(self.active_suites), logs=str(out))
             try:
                 async with asyncio.timeout(self.cfg.suite_timeout_seconds):
                     result = await self.evaluator(
@@ -163,20 +199,26 @@ class Experiment:
                 write_json(out / "eval_result.json", result)
                 record.update(status="complete", result_sha256=digest((out / "eval_result.json").read_bytes()))
                 write_json(status_path, record)
-                self.event("suite_complete", domain=domain, suite=label,
+                self.event("suite_complete", **details, elapsed_seconds=round(time.monotonic() - started_at, 2),
+                           result=str(out / "eval_result.json"),
                            **{arm: aggregate([result], names, arm)["mean"] for arm in arms})
                 return {"result": result, "directory": str(out.relative_to(self.root))}
             except asyncio.CancelledError:
                 write_json(status_path, {**record, "status": "interrupted"})
+                self.event("suite_interrupted", **details, elapsed_seconds=round(time.monotonic() - started_at, 2),
+                           details=str(status_path))
                 raise
             except Exception as error:
                 # Do not leak provider response bodies/credentials into console output.
                 write_json(status_path, {**record, "status": "failed", "error_type": type(error).__name__,
                                          "error": redact(str(error))[:3000]})
-                self.event("suite_failed", domain=domain, suite=label, error=type(error).__name__)
+                self.event("suite_failed", **details, error=type(error).__name__,
+                           elapsed_seconds=round(time.monotonic() - started_at, 2), details=str(status_path))
                 return None
             finally:
-                self.active_suites.discard(f"{domain}/{label}")
+                self.active_suites.discard(suite_id)
+        finally:
+            self.suite_slots.release()
 
     async def batch(self, coroutines):
         """Admission stops allow already-running suites to finish and checkpoint."""
@@ -207,6 +249,10 @@ class Experiment:
             record.update(status="complete", scores=scores, suites=[s["directory"] for s in suites])
         self.save()
 
+        self.event("candidate_evaluated", domain=domain, candidate=candidate, status=record["status"],
+                   score=record.get("scores", {}).get("mean"),
+                   skill=str(self.skill_dir(domain, candidate) / "SKILL.md"))
+
     def ranked(self, domain):
         candidates = [c for c in self.state["candidates"][domain].values() if c["status"] == "complete"]
         return sorted(candidates, key=lambda c: (-c["scores"]["mean"], c["generation"], c["id"]))
@@ -221,7 +267,10 @@ class Experiment:
             incumbent = self.state["candidates"][domain].get(current)
             if incumbent is None or best["scores"]["mean"] > incumbent["scores"]["mean"] + self.cfg.min_improvement:
                 self.state["champions"][domain] = best["id"]
-                self.event("promoted", domain=domain, candidate=best["id"], score=best["scores"]["mean"])
+                previous_score = incumbent["scores"]["mean"] if incumbent else None
+                self.event("promoted", domain=domain, candidate=best["id"], score=best["scores"]["mean"],
+                           previous_candidate=current, previous_score=previous_score,
+                           improvement=best["scores"]["mean"] - previous_score if incumbent else None)
             winner = self.state["champions"][domain]
             # best/<domain> is an exported copy; the immutable evaluated artifact is candidates/...
             target = self.root / "best" / domain
@@ -320,8 +369,12 @@ class Experiment:
         except ValueError:
             shutil.rmtree(self.skill_dir(domain, cid), ignore_errors=True)
             raise
+        parent_chars = len((self.skill_dir(domain, parent_id) / "SKILL.md").read_text())
+        self.event("candidate_submitted", domain=domain, candidate=cid, generation=generation,
+                   parent=parent_id, hypothesis=hypothesis, skill_chars=len(skill_md),
+                   chars_change=len(skill_md) - parent_chars,
+                   skill=str(self.skill_dir(domain, cid) / "SKILL.md"))
         self.start_candidate(domain, cid)
-        self.event("candidate_submitted", domain=domain, candidate=cid, generation=generation)
         return self.job_receipt(domain, record["id"])
 
     def job_receipt(self, domain, candidate):
@@ -365,6 +418,13 @@ class Experiment:
     async def evaluate_and_select(self, domain, candidate):
         await self.evaluate_candidate(domain, candidate)
         self.select(domain)
+        record = self.state["candidates"][domain][candidate]
+        champion = self.state["champions"].get(domain)
+        self.event("candidate_decision", domain=domain, candidate=candidate,
+                   decision="champion" if candidate == champion else (
+                       "not_promoted" if record["status"] == "complete" else record["status"]),
+                   score=record.get("scores", {}).get("mean"), champion=champion,
+                   champion_score=self.state["candidates"][domain].get(champion, {}).get("scores", {}).get("mean"))
         self.checkpoint_agent(domain)
 
     async def search_domain(self, domain):
@@ -465,6 +525,10 @@ class Experiment:
             await asyncio.sleep(30)
             self.event("progress", active_suites=len(self.active_suites),
                        suites=sorted(self.active_suites),
+                       queued_suites=sorted(self.queued_suites),
+                       pending_candidates={d: sum(c["status"] == "pending" for c in candidates.values())
+                                           for d, candidates in self.state["candidates"].items()},
+                       optimizer_calls=self.state["optimizer_calls"],
                        agents={d: a["status"] for d, a in self.state["agents"].items()},
                        minutes_left=round(max(0, self.state["deadline"] - time.time()) / 60, 1))
 
@@ -474,6 +538,9 @@ class Experiment:
         self.state.setdefault("deadline", time.time() + self.cfg.max_hours * 3600)
         self.save()
         self.check_stop()
+        self.event("research_started", output=str(self.root), model=self.cfg.optimizer_model,
+                   max_parallel_suites=self.cfg.max_parallel_suites, max_task_containers=self.cfg.max_task_containers,
+                   events=str(self.root / "events.jsonl"))
         heartbeat = asyncio.create_task(self.heartbeat())
         try:
             async with asyncio.timeout(max(0, self.state["deadline"] - time.time())):

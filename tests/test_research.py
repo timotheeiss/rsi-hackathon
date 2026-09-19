@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import os
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -126,6 +128,21 @@ class ResearchTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_end_to_end_selection_resume_and_sealed_holdout(self):
         await self.exp.run()
+        events = [json.loads(line) for line in (self.exp.root / "events.jsonl").read_text().splitlines()]
+        candidate_events = [e for e in events if e.get("domain") == "health" and e.get("candidate") == "g0001-c01"]
+        kinds = [e["event"] for e in candidate_events]
+        self.assertLess(kinds.index("candidate_submitted"), kinds.index("suite_queued"))
+        self.assertLess(kinds.index("suite_queued"), kinds.index("suite_started"))
+        self.assertLess(kinds.index("suite_complete"), kinds.index("candidate_decision"))
+        submission = next(e for e in candidate_events if e["event"] == "candidate_submitted")
+        self.assertEqual(Path(submission["skill"]).read_text(), skill(.7 + .1))
+        self.assertEqual(submission["hypothesis"], f"Test score {.7 + .1}")
+        completion = next(e for e in candidate_events if e["event"] == "suite_complete")
+        self.assertAlmostEqual(completion["skill"], .8)
+        self.assertGreaterEqual(completion["elapsed_seconds"], 0)
+        self.assertTrue(Path(completion["result"]).exists())
+        self.assertFalse(self.exp.queued_suites)
+        self.assertFalse(self.exp.active_suites)
         self.assertEqual(self.exp.state["generation"], 2)
         self.assertLessEqual(self.evaluator.peak, 3)
         self.assertGreater(self.evaluator.peak, 1)
@@ -151,6 +168,24 @@ class ResearchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls, len(self.evaluator.calls))
         with self.assertRaisesRegex(ValueError, "sealed"):
             await resumed.run()
+
+    def test_events_escape_terminal_controls_and_redact_both_outputs(self):
+        output = io.StringIO()
+        secret = "fake-api-secret-for-test"
+        hypothesis = "Compare strategies\n\x1b[2J" + secret + "x" * 400
+        with patch.dict(os.environ, {"OPENAI_API_KEY": secret}), redirect_stdout(output):
+            self.exp.event("candidate_submitted", domain="health", hypothesis=hypothesis,
+                           nested={"tokens": [secret]})
+        console = output.getvalue()
+        raw = (self.exp.root / "events.jsonl").read_text()
+        event = json.loads(raw)
+        self.assertEqual(len(console.splitlines()), 1)
+        self.assertNotIn("\x1b", console)
+        self.assertNotIn(secret, console + raw)
+        self.assertTrue(event["timestamp"].endswith("Z"))
+        self.assertEqual(event["hypothesis"], hypothesis.replace(secret, "[REDACTED]"))
+        self.assertEqual(event["nested"]["tokens"], ["[REDACTED]"])
+        self.assertIn("...", console)
 
     async def test_negative_health_scores_are_not_clipped(self):
         await self.exp.run()

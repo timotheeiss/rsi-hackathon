@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 from agents import Model, ModelResponse, ShellCallOutcome, ShellCommandOutput, ShellResult
@@ -251,6 +251,11 @@ class SDKResearchTests(unittest.IsolatedAsyncioTestCase):
         researcher = AstraResearcher(self.exp, "health", model=model, workspace=TestWorkspace(self.exp, "health"))
         try:
             await researcher.investigate(1, 1)
+            events = [json.loads(line) for line in (self.exp.root / "events.jsonl").read_text().splitlines()]
+            self.assertTrue(any(e["event"] == "optimizer_retry" and e["http_status"] == 429 for e in events))
+            response = next(e for e in events if e["event"] == "optimizer_response")
+            self.assertEqual(response["total_tokens"], 15)
+            self.assertGreaterEqual(response["elapsed_seconds"], 0)
             self.assertEqual(self.exp.state["optimizer_calls"], 2)
             self.assertEqual(len(requests), 2)
             self.exp.cfg = replace(self.cfg, max_optimizer_calls=2)
@@ -260,6 +265,22 @@ class SDKResearchTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await researcher.close()
             await client.close()
+
+    async def test_shell_logs_before_execution_and_reports_outcomes(self):
+        workspace = ResearchWorkspace(self.exp, "health")
+        workspace.prepare()
+        async def execute(*args, **kwargs):
+            event = json.loads((self.exp.root / "events.jsonl").read_text().splitlines()[-1])
+            self.assertEqual(event["event"], "research_shell_started")
+            return 0, "analysis output", ""
+        from types import SimpleNamespace
+        request = SimpleNamespace(data=shell_call(1, "echo analysis"))
+        with patch("skilltrainbench.research.workspace.command_output", new=AsyncMock(side_effect=execute)):
+            result = await workspace.shell(request)
+        self.assertEqual(result.output[0].stdout, "analysis output")
+        event = json.loads((self.exp.root / "events.jsonl").read_text().splitlines()[-1])
+        self.assertEqual(event["event"], "research_shell")
+        self.assertEqual(event["outcomes"], [{"type": "exit", "exit_code": 0}])
 
     async def test_interrupted_job_resumes_without_duplicate_submission(self):
         await self.exp.evaluate_candidate("health", "seed")

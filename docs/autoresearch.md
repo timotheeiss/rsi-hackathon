@@ -139,6 +139,31 @@ These are workload bounds, **not a hard dollar budget**. Use provider-side spend
 
 ## Inspect, stop, resume, and finalize
 
+Progress is printed immediately to the terminal with UTC timestamps and saved as
+structured records in `<output>/events.jsonl`. Both researchers report their domain
+on each event. Important events include:
+
+- `candidate_submitted`: the hypothesis, parent, new skill path, character count,
+  and size change. This means the skill is saved and admitted for evaluation.
+- `suite_queued` / `suite_started`: candidate, split, arms, task count, queue wait,
+  and the directory containing the benchmark logs.
+- `suite_complete`: baseline/placebo/skill scores for the arms evaluated, duration,
+  and result file. `suite_cached` identifies reused results.
+- `candidate_evaluated`, `candidate_decision`, and `promoted`: aggregate score,
+  selection outcome, current champion, and improvement when a skill takes the lead.
+- `researcher_started` / `researcher_complete`: round, submission allowance,
+  submitted candidates, and saved findings. Model requests/responses, API retries,
+  shell starts/outcomes, and completed hosted web search actions are also logged.
+- `candidate_rejected`, `suite_failed`, and interruption events identify problems
+  and point to available details. A heartbeat every 30 seconds shows active and
+  queued suites, pending candidates, API calls, and time remaining.
+
+Long hypotheses are abbreviated in the terminal; the full text is retained in the
+JSON event. Environment API keys/tokens are redacted from event fields. Raw shell
+commands, command output, and model reasoning are not printed to the progress log.
+These logging changes are part of the frozen runtime: use a fresh output directory
+when updating an existing experiment to this code.
+
 ```bash
 uv run stbench-research status
 cat runs/autoresearch-sdk/report.md
@@ -173,7 +198,7 @@ Outputs:
 runs/autoresearch-sdk/
   manifest.json                 fixed inputs, split IDs, hashes
   state.json                    resumable search state and admission counters
-  events.jsonl                  suite starts/completions, promotions, failures
+  events.jsonl                  timestamped research, candidate, suite, and selection events
   leaderboard.json / report.md  scores and hypotheses
   usage.json                    observed benchmark and optimizer usage
   best/health/SKILL.md           exported development champion

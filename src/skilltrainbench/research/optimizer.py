@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 
 from agents import (
     Agent, MaxTurnsExceeded, ModelSettings, OpenAIResponsesModel, RunConfig, Runner,
@@ -78,11 +79,15 @@ class MeteredResponsesModel(OpenAIResponsesModel):
             log = self.directory / f"call-{call_id:05d}.json"
             base = {"model": self.exp.cfg.optimizer_model, "domain": self.domain}
             write_json(log, {**base, "status": "started"})
-            self.exp.event("optimizer_call", domain=self.domain, call=call_id)
+            started_at = time.monotonic()
+            self.exp.event("optimizer_call", domain=self.domain, call=call_id, attempt=attempt + 1,
+                           model=self.exp.cfg.optimizer_model)
             try:
                 result = await super().get_response(*args, **kwargs)
             except asyncio.CancelledError:
                 write_json(log, {**base, "status": "interrupted"})
+                self.exp.event("optimizer_interrupted", domain=self.domain, call=call_id,
+                               elapsed_seconds=round(time.monotonic() - started_at, 2))
                 raise
             except (APIConnectionError, APIStatusError) as error:
                 status = getattr(error, "status_code", None)
@@ -90,19 +95,32 @@ class MeteredResponsesModel(OpenAIResponsesModel):
                 write_json(log, {**base, "status": "retry" if retryable and attempt < 2 else "error",
                                  "http_status": status, "error": type(error).__name__})
                 if not retryable or attempt == 2:
+                    self.exp.event("optimizer_failed", domain=self.domain, call=call_id,
+                                   error=type(error).__name__, http_status=status, details=str(log))
                     raise RuntimeError(f"Astra {type(error).__name__} (HTTP {status}); check API access and credits") from None
                 header = error.response.headers.get("retry-after") if isinstance(error, APIStatusError) else None
                 try:
                     delay = min(60, max(1, float(header))) if header else 2 ** attempt
                 except ValueError:
                     delay = 2 ** attempt
+                self.exp.event("optimizer_retry", domain=self.domain, call=call_id,
+                               error=type(error).__name__, http_status=status, retry_in_seconds=delay)
                 await asyncio.sleep(delay)
                 continue
             except Exception as error:
                 write_json(log, {**base, "status": "error", "error": type(error).__name__})
+                self.exp.event("optimizer_failed", domain=self.domain, call=call_id,
+                               error=type(error).__name__, details=str(log))
                 raise
             usage = {k: getattr(result.usage, k) for k in ("input_tokens", "output_tokens", "total_tokens")}
             write_json(log, {**base, "status": "completed", "id": result.response_id, "usage": usage})
+            self.exp.event("optimizer_response", domain=self.domain, call=call_id,
+                           elapsed_seconds=round(time.monotonic() - started_at, 2), **usage,
+                           actions=[item.type for item in result.output if item.type not in {"reasoning", "message"}])
+            for item in result.output:
+                if item.type == "web_search_call":
+                    self.exp.event("research_web_search", domain=self.domain, call=call_id,
+                                   action=item.action.type, status=item.status)
             return result
         raise AssertionError("unreachable")
 
@@ -133,6 +151,12 @@ class AstraResearcher:
         self.session = SQLiteSession(domain, self.directory / "session.sqlite")
 
     async def investigate(self, generation: int, allowance: int):
+        started_at = time.monotonic()
+        records = self.exp.state["candidates"][self.domain]
+        existing = set(records)
+        self.exp.event("researcher_started", domain=self.domain, generation=generation, allowance=allowance,
+                       model=self.exp.cfg.optimizer_model, champion=self.exp.state["champions"].get(self.domain),
+                       completed_candidates=sum(c["status"] == "complete" for c in records.values()))
         await self.workspace.start()
         self.workspace.generation, self.workspace.allowance = generation, allowance
         self.workspace.refresh()
@@ -145,7 +169,6 @@ class AstraResearcher:
                   "Investigate code and evidence with bash and web search, then submit promising skills through "
                   "/workspace/outbox. Jobs run concurrently. Finish with findings and next steps for this round."}
         write_json(directory / "context.json", prompt)
-        self.exp.event("researcher_started", domain=self.domain, generation=generation, allowance=allowance)
         watch = asyncio.create_task(self.workspace.watch())
         run = asyncio.create_task(Runner.run(
             self.agent, json.dumps(prompt, ensure_ascii=False), session=self.session,
@@ -157,16 +180,28 @@ class AstraResearcher:
                 watch.result()  # Propagate budget/admission errors and stop the SDK turn.
             try:
                 result = await run
+                status = "complete"
                 write_json(directory / "research.json", {"status": "complete", "summary": str(result.final_output)})
             except MaxTurnsExceeded:
+                status = "turn_limit"
                 write_json(directory / "research.json", {"status": "turn_limit", "summary": "Research turn limit reached"})
             self.workspace.collect_submissions()
+        except asyncio.CancelledError:
+            self.exp.event("researcher_interrupted", domain=self.domain, generation=generation,
+                           elapsed_seconds=round(time.monotonic() - started_at, 2))
+            raise
+        except Exception as error:
+            self.exp.event("researcher_failed", domain=self.domain, generation=generation,
+                           error=type(error).__name__, elapsed_seconds=round(time.monotonic() - started_at, 2))
+            raise
         finally:
             for task in (watch, run):
                 if not task.done():
                     task.cancel()
             await asyncio.gather(watch, run, return_exceptions=True)
-        self.exp.event("researcher_complete", domain=self.domain, generation=generation)
+        self.exp.event("researcher_complete", domain=self.domain, generation=generation, status=status,
+                       elapsed_seconds=round(time.monotonic() - started_at, 2),
+                       candidates_submitted=sorted(set(records) - existing), findings=str(directory / "research.json"))
 
     async def close(self):
         try:
