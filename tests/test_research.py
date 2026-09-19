@@ -15,7 +15,6 @@ from skilltrainbench import evaluate
 from skilltrainbench.research.engine import Experiment, StopResearch
 from skilltrainbench.research.feedback import aggregate, complete_scores, feedback
 from skilltrainbench.research.optimizer import AstraResearcher, MeteredResponsesModel
-from skilltrainbench.research.tools import ResearchTools
 from skilltrainbench.research.settings import Domain, Settings, load_settings
 from skilltrainbench.research.storage import experiment_lock, read_json, split_tasks, write_json
 from skilltrainbench.tasks import REQUIRED_FILES, Task
@@ -105,10 +104,9 @@ class FakeResearchers:
             async def investigate(self, generation, allowance):
                 owner.prompts.append(experiment.research_brief(domain))
                 parent = experiment.state["champions"][domain]
-                bridge = ResearchTools(experiment, domain)
-                bridge.generation, bridge.allowance = generation, allowance
                 for index, value in enumerate((0.7 + generation / 10, -0.1 * generation)[:allowance]):
-                    bridge.submit_candidate(f"hypothesis-{index}", parent, f"Test score {value}", skill(value))
+                    experiment.submit_candidate(domain, generation, allowance, f"hypothesis-{index}",
+                                                parent, f"Test score {value}", skill(value))
 
             async def close(self):
                 pass
@@ -269,12 +267,10 @@ class ResearchTests(unittest.IsolatedAsyncioTestCase):
     async def test_malformed_and_duplicate_submissions_are_rejected(self):
         await self.exp.evaluate_candidate("health", "seed")
         self.exp.select()
-        bridge = ResearchTools(self.exp, "health")
-        bridge.generation, bridge.allowance = 1, 2
         for content in (skill(.2), "no frontmatter"):
             with self.assertRaises(ValueError):
-                bridge.submit_candidate("bad", "seed", "invalid", content)
-        self.assertEqual(list(bridge.records), ["seed"])
+                self.exp.submit_candidate("health", 1, 2, "bad", "seed", "invalid", content)
+        self.assertEqual(list(self.exp.state["candidates"]["health"]), ["seed"])
         self.assertFalse(self.exp.jobs["health"])
 
     def test_feedback_cannot_read_outside_suite_or_holdout(self):

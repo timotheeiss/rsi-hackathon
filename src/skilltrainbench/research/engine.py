@@ -36,6 +36,7 @@ class Experiment:
         self.task_slots = asyncio.Semaphore(cfg.max_task_containers)
         self.researcher_factory = researcher_factory or AstraResearcher
         self.jobs = {d: {} for d in cfg.domains}
+        self.research_image_lock = asyncio.Lock()
         self.state.setdefault("agents", {d: {"generation": self.state["generation"],
                                             "proposed_generation": self.state["generation"], "status": "pending"}
                                           for d in cfg.domains})

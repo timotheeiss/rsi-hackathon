@@ -10,7 +10,7 @@ dependencies = [
     "python-dotenv>=1.2.3",
     "harbor>=0.22.0",
     "huggingface_hub>=0.24",
-    "openai-agents>=0.10,<1",
+    "openai-agents>=0.20,<0.21",
 ]
 
 [project.scripts]

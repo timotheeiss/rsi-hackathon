@@ -1936,7 +1936,7 @@ requires-dist = [
     { name = "harbor", specifier = ">=0.22.0" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "huggingface-hub", specifier = ">=0.24" },
-    { name = "openai-agents", specifier = ">=0.10,<1" },
+    { name = "openai-agents", specifier = ">=0.20,<0.21" },
     { name = "python-dotenv", specifier = ">=1.2.3" },
     { name = "uvicorn", specifier = ">=0.29" },
 ]

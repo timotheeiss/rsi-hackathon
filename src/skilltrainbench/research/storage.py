@@ -99,6 +99,7 @@ def manifest(cfg: Settings, contract: HackathonCfg) -> dict:
     return {
         "version": 1, "settings": cfg.identity(), "splits": splits,
         "contract_sha256": digest(cfg.contract.read_bytes()),
+        "dependency_lock_sha256": digest((cfg.root / "uv.lock").read_bytes()) if (cfg.root / "uv.lock").exists() else None,
         "runtime_sha256": tree_digest(Path(__file__).parents[1]),
         "data_sha256": {d: {n: tree_digest(contract.domain(d).dataset_dir / n)
                              for names in split.values() for n in names}

@@ -2,12 +2,12 @@
 # Change output to start a new experiment with different settings.
 [research]
 contract = "hackathon.toml"
-output = "runs/autoresearch"
+output = "runs/autoresearch-sdk"
 optimizer_model = "gpt-6-astra"
 reasoning_effort = "high"
 max_output_tokens = 40000
 generations = 10                  # proposal rounds PER agent; 0 = until a limit
-candidates_per_domain = 5        # maximum variants in one Astra request
+candidates_per_domain = 5        # maximum submissions per SDK research round
 max_inflight_candidates_per_domain = 5  # refill as individual results arrive
 keep_top = 3
 max_parallel_suites = 5          # use 10 on a larger machine / after observing load
@@ -17,7 +17,7 @@ repeats = 1                     # use 2–3 in a NEW experiment to reduce sampli
 seed = 42
 min_improvement = 0.001
 max_evaluations = 120            # includes controls, seeds, retries, and final holdout
-max_optimizer_calls = 40         # counts HTTP retries too
+max_optimizer_calls = 240       # all SDK model steps and HTTP retries
 suite_timeout_seconds = 14400
 max_hours = 12                   # persistent wall-clock deadline from the first run
 feedback_examples = 6

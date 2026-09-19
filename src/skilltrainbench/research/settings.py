@@ -25,6 +25,7 @@ class Settings:
     candidates_per_domain: int = 5
     max_inflight_candidates_per_domain: int = 5
     researcher_max_turns: int = 12
+    researcher_image: str = "stbench-researcher:py312-v1"
     keep_top: int = 3
     max_parallel_suites: int = 5
     tasks_per_suite: int = 2

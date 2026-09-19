@@ -1,6 +1,6 @@
 # Health and HLE skill autoresearch
 
-`stbench-research` uses **GPT-6 Astra (`gpt-6-astra`)** through the OpenAI Responses API to improve the two draft skills in `submissions/aditya-tim/`. It evaluates them through this repository's existing Harbor/Docker runtime. The learner remains **`zai-glm-5-3-flash`**, and the graders and task limits remain those in `hackathon.toml`.
+`stbench-research` uses **GPT-6 Astra (`gpt-6-astra`)** as two independent **OpenAI Agents SDK** researchers using the Responses API to improve the two draft skills in `submissions/aditya-tim/`. It evaluates them through this repository's existing Harbor/Docker runtime. The learner remains **`zai-glm-5-3-flash`**, and the graders and task limits remain those in `hackathon.toml`.
 
 The loop takes the useful pattern from [uditgoenka/autoresearch](https://github.com/uditgoenka/autoresearch): form a hypothesis, make a constrained change, measure it, retain improvements, and repeat. This implementation uses immutable candidate folders and JSON checkpoints instead of editing or reverting the working tree.
 
@@ -32,6 +32,44 @@ The smoke optimizes on tiny samples and should not be used to choose a final sub
 
 `OPENAI_API_KEY` pays for Astra; `RUNWARE_API_KEY` pays for the fixed learner and graders. `HF_TOKEN` is optional. Environment variables already set in the shell take precedence over `.env`. `--env-file /path/to/file` selects another env file. Optional `AUTORESEARCH_OPENAI_BASE_URL` selects the curator's Responses endpoint; it does not reroute the learner. Access to Astra in an app does not establish API access for your key. See [Astra's official model reference](https://developers.openai.com/api/docs/models/gpt-6-astra).
 
+## Three-hour EC2 search
+
+After transferring this version and running `uv sync --locked`, use:
+
+```bash
+# Build the shell image before starting the research clock (no paid API calls).
+docker build -t stbench-researcher:py312-v1 \
+  -f src/skilltrainbench/research/researcher.Dockerfile src/skilltrainbench/research
+uv run stbench-research plan --config autoresearch.3h.toml
+uv run stbench-research doctor --config autoresearch.3h.toml
+uv run stbench-research run --config autoresearch.3h.toml
+```
+
+This preset permits five candidates per domain in flight, ten simultaneous suites,
+four tasks per suite, and sixteen benchmark task containers globally. Both researchers
+share limits of 64 suite starts and 120 Astra HTTP attempts. The search cancels unfinished
+work at three hours and preserves completed winners. Actual throughput also depends on
+provider latency and quotas; more suites cannot guarantee a specific improvement.
+
+To make iterations shorter, it uses **four development tasks per domain**, sampled from
+the full preset's dev set. It retains the full preset's **30 Health / 24 HLE holdout tasks**.
+Four tasks provide noisy, easily overfit feedback; this is a rapid exploration preset.
+After the search, assess the frozen winners separately:
+
+```bash
+uv run stbench-research finalize --config autoresearch.3h.toml
+```
+
+Finalization runs outside the three-hour search window and does not feed its scores
+back to Astra. Use the larger full preset for more reliable development selection.
+
+**Upgrading an existing run:** stop it before replacing code or syncing files into its
+checkout. The SDK presets use new output folders (`runs/autoresearch-sdk*`), preserving
+old smoke/full artifacts. Runtime/config changes intentionally cannot resume an older
+manifest. This update does not modify or restart an already-running remote process.
+For a custom config, choose a fresh output directory and increase `max_optimizer_calls`
+to account for the SDK's multiple model steps per research round.
+
 ## Run on an Apple Silicon Mac
 
 Use Docker Desktop and `autoresearch.local.toml`. This preset keeps the full
@@ -61,12 +99,22 @@ you are not using it.
 
 ## What it does
 
-1. Validate the seed skills; snapshot them and the learner contract. Hash the source runtime, selected task files, original skills, configuration, and split membership.
-2. Evaluate no-skill and placebo controls once on each development split, followed by the original draft. All candidates use exactly the same development tasks.
-3. Give Astra the scoring contract, actual generic grader source, retained parent skills, recent experiment history, and a bounded selection of development answers, grader verdicts, and trajectory/log excerpts. Include losing hypotheses as well as the champion.
-4. Ask for five complete `SKILL.md` variants per domain with explicit hypotheses. Validate and store each separately. Supporting files are inherited unchanged. Invalid, duplicate, oversized, or identifier-containing candidates are rejected before evaluation.
-5. Schedule suites across both domains. Separate semaphores cap simultaneous suites, tasks within a suite, and all task containers across the process. Every suite has its own gateways, ledgers, Docker trial directories, and timeout.
-6. Rank complete results by mean development reward, keep the top three as parents, and promote an improvement greater than `min_improvement`. Ties keep the incumbent. Repeat for the configured number of generations, or use `generations = 0` to continue until a budget, deadline, interruption, or STOP file.
+Health and HLE each have their own Astra `Agent`, persistent `SQLiteSession`, research workspace, candidate history, and champion. The SDK handles reasoning and tool calling. The only agent tools are **`ShellTool` and `WebSearchTool`**, following the [official SDK guide](https://developers.openai.com/api/docs/guides/agents/sdk), [shell guide](https://developers.openai.com/api/docs/guides/tools-shell), and [web search guide](https://developers.openai.com/api/docs/guides/tools-web-search).
+
+1. Freeze the learner contract, inputs, disjoint splits, and seed skills.
+2. Start each domain's controls and seed suite concurrently. Each researcher begins as soon as its own bootstrap finishes; it never waits for the other domain.
+3. Astra investigates freely using bash, Python, `rg`, `jq`, and web search. It can read code, inspect development logs, write analysis scripts, keep notes, and choose what to test. There is no prepared evidence bundle or custom `read_failure`/`compare_candidates` tool API.
+4. Submit a skill by writing `SKILL.md`, `request.json`, and finally `READY` into a new directory under `/workspace/outbox/`. A Python watcher validates, snapshots, and queues it, publishing a receipt with a job ID. Submission does not wait for evaluation, and Astra can continue investigating while the job runs.
+5. The harness runs suites under shared suite/container limits. Completed candidates are ranked immediately. A free candidate slot can start a new research round while slower siblings are still running. When all slots are occupied, Python waits for results without paid model polling.
+6. Keep the best development skill and up to `keep_top` parent options. `min_improvement` controls promotions. Final holdout evaluation remains a separate, explicit command.
+
+`generations` now means **SDK research rounds per domain**, independently. Each round may submit up to `candidates_per_domain` skills, with a smaller allowance when fewer slots are free. `max_inflight_candidates_per_domain` caps queued/running candidate jobs for one researcher. `researcher_max_turns` caps SDK model steps within a research round. `generations = 0` continues until a budget, persistent deadline, interruption, or STOP file.
+
+The research instructions explicitly encourage compression, deletion, section ablations, alternative strategies, and rewrites from scratch. An initial multi-candidate batch should explore a shorter skill and a different strategy alongside focused improvements; with one free slot, the researcher should vary approaches over successive submissions. It is also instructed to revisit assumptions and failure patterns when progress stalls. These are research instructions, not enforced experiment quotas. Selection remains based on measured development reward, with equal scores keeping the incumbent; there is no automatic reward for either longer or shorter files.
+
+The researchers' Docker containers are separate from benchmark containers. `/workspace` is writable and persistent. `/research` is a read-only mirror of source code, current-domain development inputs, evaluated skills, scores, and logs. Holdout data, `.env`, SSH keys, the host project, and Docker's socket are not mounted. Shell commands run offline with a 120-second cap; online research uses the SDK's hosted web search. Each researcher container is limited to one CPU and 2 GiB of memory, in addition to the benchmark container cap. Notes and scripts persist across restarts. Source edits in the scratch workspace do not change the evaluator.
+
+The agent is instructed to research general methods, not benchmark answer keys. Broad web access means contamination cannot be ruled out automatically; review final skills for copied examples and answer lookups. SDK conversations are persisted locally in `optimizer/<domain>/session.sqlite`; external SDK tracing is disabled. OpenAI still receives the model inputs, tool outputs, and search requests needed to run the agent.
 
 HealthBench uses the **mean raw rubric reward**: satisfied positive and negative criteria contribute points divided by total positive points. Individual rewards can be negative. The official display additionally clips the aggregate to [0,1]. HLE uses the mean of binary correct/incorrect judgments. The leaderboard subtracts placebo performance; since the development placebo is cached and shared, maximizing raw reward ranks candidates identically to maximizing placebo lift. Local development lift is an estimate, not the private leaderboard score.
 
@@ -76,12 +124,12 @@ The checked-in full configuration preserves your existing **16 Health dev / 30 H
 
 ## Workload and limits
 
-The full default has five variants per domain, ten generations, five suites at once, two tasks per suite, and a **global cap of ten active task attempts**. To admit ten suites simultaneously, set `max_parallel_suites = 10`; keeping `max_task_containers = 10` still caps overall load.
+The full default allows up to five candidates per research round and five candidates in flight per domain, ten rounds per domain, five suites at once, two tasks per suite, and a **global cap of ten active benchmark task attempts**. To admit ten suites simultaneously, set `max_parallel_suites = 10`; keeping `max_task_containers = 10` still caps overall load.
 
 The default plan is at most **108 suites / 2,336 task attempts** including controls, original skills, and final holdout comparisons, before infrastructure retries. A task can use many model calls; Health grading can issue several concurrent rubric calls. API request/token rate limits may bottleneck before CPU or RAM. Reduce concurrency if rate limits are frequent.
 
 - `max_evaluations` counts suite starts, including interrupted/failed starts. It persists across resumes. Two suites per domain per repeat are reserved for finalization.
-- `max_optimizer_calls` counts every Astra HTTP attempt, including retries. Astra retries transient failures with bounded backoff.
+- `max_optimizer_calls` counts every SDK model step and HTTP retry, shared by both researchers. It is no longer a count of single-shot proposal batches. The full preset allows 240 calls; smoke allows 40. Hosted web search may incur additional tool charges. Transient HTTP failures retry with bounded backoff, and each attempt is counted before sending.
 - `suite_timeout_seconds` bounds an individual suite; the existing task timeouts remain intact.
 - `max_hours` is a persistent wall-clock deadline beginning with the first `run`. It does not reset on restart. Finalization has separate suite timeouts and can run after the search deadline.
 - `hackathon.toml` already caps each suite's learner and grader token pools. They are unchanged.
@@ -93,18 +141,18 @@ These are workload bounds, **not a hard dollar budget**. Use provider-side spend
 
 ```bash
 uv run stbench-research status
-cat runs/autoresearch/report.md
-cat runs/autoresearch/usage.json
-tail -f runs/autoresearch/events.jsonl
+cat runs/autoresearch-sdk/report.md
+cat runs/autoresearch-sdk/usage.json
+tail -f runs/autoresearch-sdk/events.jsonl
 
 # Graceful admission stop: already-running suites finish, then the process exits.
-touch runs/autoresearch/STOP
+touch runs/autoresearch-sdk/STOP
 # To resume after a STOP:
-rm runs/autoresearch/STOP
+rm runs/autoresearch-sdk/STOP
 uv run stbench-research run
 ```
 
-Ctrl+C or SIGTERM cancels active tasks and checkpoints interrupted suites. Restarting the same command reuses completed suites and proposals; it reruns incomplete work, which may incur charges again. Failed candidates are skipped for the current generation. Failure of the original skill or controls stops the run so you can correct infrastructure and retry. Each failure has an `error` field in its `suite.json` and retains any trial/ledger artifacts.
+Ctrl+C or SIGTERM cancels active tasks, closes the researcher containers, and checkpoints interrupted suites. Restarting the same command reuses completed suites, researcher sessions, notes, and submission receipts; incomplete suites rerun and may incur charges again. Exact submission retries return the existing job ID. Failed candidates are skipped for that round. Failure of an original skill or control suite stops that domain; the other researcher can continue. Each failure has an `error` field in its `suite.json` and retains any trial/ledger artifacts.
 
 Keep the same config, seed skills, task files, and runtime code to resume. Changing any of them intentionally requires a **new output directory**. This prevents comparing different learners, datasets, or resource settings in one ranking. Relative artifact paths allow copying the experiment to a different host and continuing there. Do not copy an experiment while it is running; stop it first. `plan` also freezes the inputs, so choose settings before running it.
 
@@ -112,9 +160,9 @@ After development, explicitly evaluate the selected skills:
 
 ```bash
 uv run stbench-research finalize
-cat runs/autoresearch/holdout_report.json
-uv run stbench check-skill runs/autoresearch/best/health
-uv run stbench check-skill runs/autoresearch/best/hle
+cat runs/autoresearch-sdk/holdout_report.json
+uv run stbench check-skill runs/autoresearch-sdk/best/health
+uv run stbench check-skill runs/autoresearch-sdk/best/hle
 ```
 
 Finalization seals the experiment **before any holdout result is exposed**. It evaluates the selected skill against no-skill/placebo controls and the original draft on the local holdout. It reports lift over both placebo and the original draft; it does not change the selected skills. No more optimization is allowed in that experiment. Rerun `finalize` to recover incomplete suites; completed results are reused. A provider/infra error may consume the remaining evaluation allowance; if it does, the report stays incomplete rather than overspending the cap.
@@ -122,7 +170,7 @@ Finalization seals the experiment **before any holdout result is exposed**. It e
 Outputs:
 
 ```text
-runs/autoresearch/
+runs/autoresearch-sdk/
   manifest.json                 fixed inputs, split IDs, hashes
   state.json                    resumable search state and admission counters
   events.jsonl                  suite starts/completions, promotions, failures
@@ -131,7 +179,10 @@ runs/autoresearch/
   best/health/SKILL.md           exported development champion
   best/hle/SKILL.md
   candidates/<domain>/<id>/skill/  immutable skill packages
-  optimizer/<domain>/generation-*/  prompts, analysis, proposals, API usage
+  optimizer/<domain>/generation-*/  round prompts, summaries, API usage
+  optimizer/<domain>/session.sqlite  persistent SDK conversation
+  researchers/<domain>/work/         writable notes, scripts, outbox submissions
+  researchers/<domain>/view/         read-only development evidence and job receipts
   evaluations/<domain>/<suite>/attempt-*/
     eval_result.json
     attempts.jsonl
@@ -140,7 +191,7 @@ runs/autoresearch/
   holdout_report.json           final assessment, after finalize
 ```
 
-The original submission folders remain untouched. Copy the exported winners into your submission when ready. Static checks and the optimizer prompt discourage benchmark memorization and grader manipulation, but do not prove their absence; review the resulting skills under the hackathon rules before submission. No candidate-generated code is executed on the host. Only `SKILL.md` is generated, and it is mounted for the existing learner as usual.
+The original submission folders remain untouched. Copy the exported winners into your submission when ready. Static checks and the optimizer prompt discourage benchmark memorization and grader manipulation, but do not prove their absence; review the resulting skills under the hackathon rules before submission. Researcher-written analysis scripts run only in the researcher container. Only the submitted `SKILL.md` becomes a benchmark candidate, mounted for the existing learner as usual.
 
 ## EC2 choice and SSH deployment
 
@@ -156,7 +207,7 @@ Transfer from your Mac (replace the host and key paths):
 ```bash
 rsync -az --progress -e 'ssh -i ~/.ssh/hackathon.pem' \
   --exclude=.git --exclude=.venv --exclude=.env --exclude='runs/' \
-  --exclude='__pycache__/' --exclude='.DS_Store' \
+  --exclude='__pycache__/' --exclude='.DS_Store' --exclude='*.pem' \
   ./ ubuntu@EC2_HOST:/home/ubuntu/rsi-hackathon/
 
 ssh -i ~/.ssh/hackathon.pem ubuntu@EC2_HOST
@@ -173,7 +224,7 @@ docker info
 uv run stbench-research doctor --config autoresearch.smoke.toml
 ```
 
-That transfer includes downloaded data if it exists locally. Otherwise run `uv run stbench data pull` on EC2. It excludes `.env`; enter keys on EC2 or transfer them separately over SSH. To resume an existing experiment, stop it first and transfer its `runs/autoresearch/` directory as well as the exact original code/config/skills/data.
+That transfer includes downloaded data if it exists locally. Otherwise run `uv run stbench data pull` on EC2. It excludes `.env`; enter keys on EC2 or transfer them separately over SSH. To resume an existing experiment, stop it first and transfer its `runs/autoresearch-sdk/` directory as well as the exact original code/config/skills/data.
 
 Run interactively in a persistent terminal:
 
@@ -203,4 +254,4 @@ The service does not automatically restart failed paid runs. A host hard kill ma
 uv run python -m unittest discover -s tests -v
 ```
 
-Tests use synthetic evaluators and a mocked Responses transport. They exercise the multi-generation loop, shared concurrency, selection with negative rewards, invalidation handling, state recovery, task/config/skill hashes, holdout sealing, budgets, and API retries without Docker or paid API calls. The real smoke configuration is the next deployment check.
+Tests exercise the real SDK runner with a scripted model, a mocked Responses HTTP transport, and synthetic evaluators. They exercise the multi-generation loop, shared concurrency, selection with negative rewards, invalidation handling, state recovery, shell continuation after background submission, persistent sessions, domain independence, job idempotency, task/config/skill hashes, holdout isolation, budgets, and API retries without Docker or paid API calls. The real smoke configuration is the next deployment check.
