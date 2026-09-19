@@ -49,6 +49,33 @@ def aggregate(results: list[dict], names: list[str], arm: str) -> dict:
             "repeat_means": means, "repeat_stddev": statistics.stdev(means) if len(means) > 1 else None}
 
 
+def aggregate_subsets(results: list[dict], subsets: dict[str, list[str]], groups: dict[str, str],
+                      arm: str, repeats: int) -> dict:
+    """Join disjoint subsets per repeat; every task gets equal weight, never partial scores."""
+    if len(results) != len(subsets) * repeats:
+        raise ValueError("incomplete development subset results")
+    names = [name for tasks in subsets.values() for name in tasks]
+    if len(set(names)) != len(names):
+        raise ValueError("overlapping development subsets")
+    merged, subset_scores = [], {}
+    for index, (subset, tasks) in enumerate(subsets.items()):
+        subset_scores[subset] = aggregate([results[r * len(subsets) + index] for r in range(repeats)], tasks, arm)
+    for repeat in range(repeats):
+        parts = results[repeat * len(subsets):(repeat + 1) * len(subsets)]
+        # aggregate above has validated each part's exact task identities and all arm scores.
+        merged.append({"tasks": names, "arms": [arm],
+                       "per_task": [{"task_name": row["task_name"], arm: row[arm]}
+                                    for part in parts for row in part["per_task"]]})
+    scores = aggregate(merged, names, arm)
+    scores["subsets"] = subset_scores
+    scores["groups"] = {
+        group: {"mean": statistics.mean(scores["per_task"][n] for n in tasks), "tasks": len(tasks)}
+        for group in sorted(set(groups.values()))
+        if (tasks := [n for n in names if groups.get(n) == group])
+    }
+    return scores
+
+
 def excerpt(path: Path, root: Path, limit=6000) -> str:
     try:
         path.resolve().relative_to(root.resolve())

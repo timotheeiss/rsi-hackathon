@@ -10,7 +10,7 @@ from pathlib import Path
 
 from .. import evaluate
 from ..config import check_skill, load_config
-from .feedback import SCORING, aggregate, complete_scores
+from .feedback import SCORING, aggregate, aggregate_subsets, complete_scores
 from .optimizer import AstraResearcher
 from .settings import Settings
 from .storage import digest, manifest, read_json, tree_digest, write_json
@@ -43,6 +43,7 @@ class Experiment:
                                           for d in cfg.domains})
         self.active_suites = set()
         self.queued_suites = set()
+        self.reserved_suites = set()
         self.finalizing = False
 
     def save(self):
@@ -90,6 +91,8 @@ class Experiment:
             write_json(self.manifest_path, expected)
             shutil.copyfile(self.cfg.contract, self.root / "hackathon.snapshot.toml")
         self.splits = expected["splits"]
+        self.dev_subsets = expected["dev_subsets"]
+        self.dev_groups = expected["dev_groups"]
         for domain, spec in self.cfg.domains.items():
             if "seed" not in self.state["candidates"][domain]:
                 self.register(domain, "seed", self.cfg.path(spec.skill), None, "Original draft", 0)
@@ -143,11 +146,15 @@ class Experiment:
         self.save()
         return self.state["optimizer_calls"]
 
-    async def suite(self, domain, label, candidate, split, arms):
+    async def suite(self, domain, label, candidate, split, arms, subset=None):
         directory = self.root / "evaluations" / domain / label
         status_path = directory / "suite.json"
-        names = self.splits[domain][split]
+        if subset is not None and split != "dev":
+            raise ValueError("subsets are only available for development")
+        names = self.dev_subsets[domain][subset] if subset is not None else self.splits[domain][split]
         details = {"domain": domain, "suite": label, "candidate": candidate, "split": split, "arms": arms}
+        if subset is not None:
+            details["subset"] = subset
         identity = {"domain": domain, "candidate": candidate, "split": split, "arms": arms, "tasks": names,
                     "skill_sha256": self.state["candidates"][domain][candidate]["sha256"] if candidate else None}
         previous = read_json(status_path) if status_path.exists() else {}
@@ -171,6 +178,7 @@ class Experiment:
             self.queued_suites.discard(suite_id)
         try:
             self.check_stop()
+            self.reserved_suites.discard((domain, label))
             reserve = 0 if self.finalizing else 2 * len(self.cfg.domains) * self.cfg.repeats
             if self.state["evaluations_started"] >= self.cfg.max_evaluations - reserve:
                 raise StopResearch("evaluation limit reached (final holdout slots are reserved)")
@@ -235,22 +243,53 @@ class Experiment:
                 raise value
         return values
 
+    def development_specs(self, domain, candidate):
+        subject = candidate or "controls"
+        return [(f"dev-{subject}{'-' + subset if subset != 'all' else ''}-r{r}", subset)
+                for r in range(self.cfg.repeats) for subset in self.dev_subsets[domain]]
+
+    def reserve_development_suites(self, domain, candidate):
+        needed = set()
+        for label, _ in self.development_specs(domain, candidate):
+            path = self.root / "evaluations" / domain / label / "suite.json"
+            if not path.exists() or read_json(path).get("status") != "complete":
+                needed.add((domain, label))
+        new = needed - self.reserved_suites
+        reserve = 2 * len(self.cfg.domains) * self.cfg.repeats
+        if self.state["evaluations_started"] + len(self.reserved_suites) + len(new) > self.cfg.max_evaluations - reserve:
+            raise StopResearch("evaluation limit cannot cover all development subsets (holdout slots are reserved)")
+        self.reserved_suites.update(new)
+
+    async def development_suites(self, domain, candidate, arms):
+        self.reserve_development_suites(domain, candidate)
+        specs = self.development_specs(domain, candidate)
+        try:
+            return await self.batch([
+                self.suite(domain, label, candidate, "dev", arms, subset=subset)
+                for label, subset in specs])
+        finally:
+            self.reserved_suites.difference_update((domain, label) for label, _ in specs)
+
+    def development_scores(self, domain, suites, arm):
+        return aggregate_subsets([s["result"] for s in suites], self.dev_subsets[domain],
+                                 self.dev_groups[domain], arm, self.cfg.repeats)
+
     async def evaluate_candidate(self, domain, candidate):
         record = self.state["candidates"][domain][candidate]
         if record["status"] in {"rejected", "complete"}:
             return
-        suites = await self.batch([
-            self.suite(domain, f"dev-{candidate}-r{r}", candidate, "dev", ["skill"])
-            for r in range(self.cfg.repeats)])
+        suites = await self.development_suites(domain, candidate, ["skill"])
         if any(s is None for s in suites):
             record.update(status="failed")
         else:
-            scores = aggregate([s["result"] for s in suites], self.splits[domain]["dev"], "skill")
+            scores = self.development_scores(domain, suites, "skill")
             record.update(status="complete", scores=scores, suites=[s["directory"] for s in suites])
         self.save()
 
         self.event("candidate_evaluated", domain=domain, candidate=candidate, status=record["status"],
                    score=record.get("scores", {}).get("mean"),
+                   subsets={s: v["mean"] for s, v in record.get("scores", {}).get("subsets", {}).items()},
+                   groups=record.get("scores", {}).get("groups", {}),
                    skill=str(self.skill_dir(domain, candidate) / "SKILL.md"))
 
     def ranked(self, domain):
@@ -292,11 +331,19 @@ class Experiment:
                 lift = score - control if control is not None else None
                 state = "champion" if self.state["champions"].get(domain) == c["id"] else "retained history"
                 row = {"domain": domain, "id": c["id"], "score": score, "placebo_lift": lift,
-                       "state": state, "hypothesis": c["hypothesis"]}
+                       "state": state, "hypothesis": c["hypothesis"],
+                       "subsets": {s: v["mean"] for s, v in c["scores"].get("subsets", {}).items()},
+                       "groups": c["scores"].get("groups", {})}
                 rows.append(row)
                 lift_text = f"{lift:.4f}" if lift is not None else "—"
                 hypothesis = c["hypothesis"].replace("|", "/").replace("\n", " ")
                 lines.append(f"| {c['id']} | {score:.4f} | {lift_text} | {state} | {hypothesis} |")
+            if len(self.dev_subsets[domain]) > 1:
+                lines.extend(["", "| Candidate | Subset means | Group means |", "|---|---|---|"])
+                for c in self.ranked(domain):
+                    subsets = ", ".join(f"{s}: {v['mean']:.4f}" for s, v in c["scores"]["subsets"].items())
+                    groups = ", ".join(f"{g.replace('|', '/')}: {v['mean']:.4f}" for g, v in c["scores"]["groups"].items())
+                    lines.append(f"| {c['id']} | {subsets} | {groups} |")
             lines.append("")
         write_json(self.root / "leaderboard.json", rows)
         write_json(self.root / "usage.json", summarize_usage(self.root))
@@ -309,6 +356,10 @@ class Experiment:
                 "contract": (self.root / "hackathon.snapshot.toml").read_text(),
                 "grader_source": self.grader_source(domain),
                 "development_tasks": self.splits[domain]["dev"],
+                "development_subsets": self.dev_subsets[domain], "development_groups": self.dev_groups[domain],
+                "evaluation_policy": "Every candidate and control uses every development subset. "
+                "Promotion requires all subsets and repeats to finish; score is the mean over all tasks, "
+                "not the best subset. Inspect subset and group regressions. These are development data, not holdout.",
                 "max_skill_chars": self.cfg.max_skill_chars}
 
     def grader_source(self, domain):
@@ -362,16 +413,19 @@ class Experiment:
                for cid, c in records.items() if c["status"] != "rejected"):
             raise ValueError("duplicate skill; inspect the existing experiment instead")
         cid = f"g{generation:04d}-c{len(members) + 1:02d}"
+        self.reserve_development_suites(domain, cid)
         try:
             record = self.register(domain, cid, self.skill_dir(domain, parent_id), skill_md,
                                    hypothesis, generation, parent_id,
                                    submission_key=submission_key, request_sha256=request_hash)
-        except ValueError:
+        except Exception:
+            self.reserved_suites.difference_update((domain, label) for label, _ in self.development_specs(domain, cid))
             shutil.rmtree(self.skill_dir(domain, cid), ignore_errors=True)
             raise
         parent_chars = len((self.skill_dir(domain, parent_id) / "SKILL.md").read_text())
         self.event("candidate_submitted", domain=domain, candidate=cid, generation=generation,
                    parent=parent_id, hypothesis=hypothesis, skill_chars=len(skill_md),
+                   subsets=len(self.dev_subsets[domain]), development_tasks=len(self.splits[domain]["dev"]),
                    chars_change=len(skill_md) - parent_chars,
                    skill=str(self.skill_dir(domain, cid) / "SKILL.md"))
         self.start_candidate(domain, cid)
@@ -383,19 +437,20 @@ class Experiment:
 
     def start_candidate(self, domain, candidate):
         if candidate not in self.jobs[domain]:
-            self.jobs[domain][candidate] = asyncio.create_task(self.evaluate_and_select(domain, candidate))
+            task = asyncio.create_task(self.evaluate_and_select(domain, candidate))
+            self.jobs[domain][candidate] = task
+            task.add_done_callback(lambda _: self.reserved_suites.difference_update(
+                (domain, label) for label, _ in self.development_specs(domain, candidate)))
 
     async def evaluate_controls(self, domain):
         # Cache each domain independently; a slow HLE suite never blocks Health.
         if domain in self.state.get("controls", {}):
             return
-        results = await self.batch([
-            self.suite(domain, f"dev-controls-r{r}", None, "dev", ["baseline", "placebo"])
-            for r in range(self.cfg.repeats)])
+        results = await self.development_suites(domain, None, ["baseline", "placebo"])
         if any(result is None for result in results):
             raise RuntimeError(f"{domain}: control suite failed; inspect suite.json and rerun to retry")
         self.state.setdefault("controls", {})[domain] = {
-            arm: aggregate([r["result"] for r in results], self.splits[domain]["dev"], arm)
+            arm: self.development_scores(domain, results, arm)
             for arm in ("baseline", "placebo")}
         self.save()
 
@@ -540,6 +595,7 @@ class Experiment:
         self.check_stop()
         self.event("research_started", output=str(self.root), model=self.cfg.optimizer_model,
                    max_parallel_suites=self.cfg.max_parallel_suites, max_task_containers=self.cfg.max_task_containers,
+                   development_subsets={d: {s: len(n) for s, n in subsets.items()} for d, subsets in self.dev_subsets.items()},
                    events=str(self.root / "events.jsonl"))
         heartbeat = asyncio.create_task(self.heartbeat())
         try:

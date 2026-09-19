@@ -45,16 +45,37 @@ uv run stbench-research doctor --config autoresearch.3h.toml
 uv run stbench-research run --config autoresearch.3h.toml
 ```
 
-This preset permits five candidates per domain in flight, ten simultaneous suites,
-four tasks per suite, and sixteen benchmark task containers globally. Both researchers
-share limits of 64 suite starts and 120 Astra HTTP attempts. The search cancels unfinished
+This preset permits **two candidate skills per domain in flight**, each evaluated on
+**four disjoint development subsets**. There can be sixteen candidate suites queued
+across both researchers; up to ten suites and sixteen benchmark task containers run
+at once. Each subset contains three questions. Both researchers share limits of
+128 suite starts and 120 Astra HTTP attempts. The search cancels unfinished
 work at three hours and preserves completed winners. Actual throughput also depends on
 provider latency and quotas; more suites cannot guarantee a specific improvement.
 
-To make iterations shorter, it uses **four development tasks per domain**, sampled from
-the full preset's dev set. It retains the full preset's **30 Health / 24 HLE holdout tasks**.
-Four tasks provide noisy, easily overfit feedback; this is a rapid exploration preset.
-After the search, assess the frozen winners separately:
+Every candidate sees **12 development questions per domain**. Each HLE subset contains
+one Chemistry, one Computer Science/AI, and one Engineering question. Each Health
+subset contains one context-seeking, one emergency-referral, and one health-data task.
+The checked-in assignments were sampled deterministically with seed 42, using only
+category/theme labels. Health draws from the existing 16-task development panel;
+HLE draws from the available training tasks after excluding the local holdout.
+The original **30 Health / 24 HLE holdout tasks** are unchanged.
+
+Controls and the original skill also run on all four subsets (16 bootstrap suites
+across both domains). A candidate is eligible for promotion only after all four
+subsets and all repeats finish successfully. The score is the equally weighted mean
+over all development questions, so unequal subset sizes cannot distort selection.
+`candidate_evaluated`, `leaderboard.json`, `report.md`, and the researcher's workspace
+include overall, per-subset, and per-subject/theme scores. All four suite slots in the
+evaluation budget are reserved when a candidate is admitted; a candidate that cannot
+fit is not launched. Suite concurrency is still bounded separately.
+
+The same four subsets are used for every candidate throughout the experiment. They
+are development data available to Astra, not four holdouts or cross-validation folds.
+This broadens coverage but does not eliminate development overfitting. The balanced
+HLE panel weights the three subjects equally; it is not an estimate weighted by their
+different frequencies in the full training dataset. Finalization still uses the
+unchanged holdout distribution. After the search, assess the frozen winners separately:
 
 ```bash
 uv run stbench-research finalize --config autoresearch.3h.toml
@@ -66,7 +87,9 @@ back to Astra. Use the larger full preset for more reliable development selectio
 **Upgrading an existing run:** stop it before replacing code or syncing files into its
 checkout. The SDK presets use new output folders (`runs/autoresearch-sdk*`), preserving
 old smoke/full artifacts. Runtime/config changes intentionally cannot resume an older
-manifest. This update does not modify or restart an already-running remote process.
+manifest. The four-subset preset uses `runs/autoresearch-sdk-3h-subsets` so the failed
+four-question run remains intact and the new experiment gets a fresh three-hour clock.
+This update does not modify or restart an already-running remote process.
 For a custom config, choose a fresh output directory and increase `max_optimizer_calls`
 to account for the SDK's multiple model steps per research round.
 
@@ -121,6 +144,14 @@ HealthBench uses the **mean raw rubric reward**: satisfied positive and negative
 An infrastructure error, missing result, nonfinite score, or grader invalidation makes the entire candidate evaluation ineligible. It cannot improve its score by excluding difficult tasks. The original evaluator retries infrastructure failures; a wrong answer is never retried selectively. Candidate repeats average every task equally. `repeats = 2` or `3` can reduce sampling noise at corresponding cost; set this before starting a new experiment. The default one-repeat development ranking is exploratory and susceptible to selection noise.
 
 The checked-in full configuration preserves your existing **16 Health dev / 30 Health validation** task IDs, now used as dev/holdout. HLE gets a deterministic shuffled **24 dev / 24 holdout** split from the downloaded training data. Remaining training tasks are unused. Explicit split files accept comma-separated or whitespace-separated names. These are local partitions of the public training data, not the organizers' private held-out tasks. If you have already tuned on a local holdout, choose a fresh untouched partition before a new experiment.
+
+For multiple development subsets, set a domain's `dev_subset_files` to a list of task-ID
+files instead of `dev_file`. The harness rejects empty subsets, unknown tasks, duplicate
+IDs within or between subsets, and overlap with holdout. Optional `dev_groups_file`
+is a JSON object mapping exactly those development task IDs to subject/theme labels;
+only these labels are exposed to the researcher. Assignments and labels are frozen in
+the manifest. `repeats = 4` alone repeats the same tasks four times; it does not create
+different subsets. Single-subset configurations continue to work.
 
 ## Workload and limits
 

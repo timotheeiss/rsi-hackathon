@@ -165,6 +165,8 @@ class ResearchWorkspace:
         write_json(self.view / "status.json", {
             "domain": self.domain, "generation": self.generation, "submission_allowance": self.allowance,
             "champion": self.exp.state["champions"].get(self.domain),
+            "development_subsets": self.exp.dev_subsets[self.domain],
+            "development_groups": self.exp.dev_groups[self.domain],
             "controls": self.exp.state.get("controls", {}).get(self.domain),
             "slots_free": max(0, self.exp.cfg.max_inflight_candidates_per_domain
                               - sum(c["status"] == "pending" for c in records.values())),

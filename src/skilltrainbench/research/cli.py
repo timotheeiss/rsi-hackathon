@@ -73,12 +73,18 @@ def main(argv=None):
             manifest = experiment.initialize()
             if args.command == "plan":
                 splits = {d: {s: len(n) for s, n in split.items()} for d, split in manifest["splits"].items()}
-                suites = None if cfg.generations == 0 else len(cfg.domains) * cfg.repeats * (
-                    2 + cfg.generations * cfg.candidates_per_domain + 2)
+                suites = None if cfg.generations == 0 else sum(cfg.repeats * (
+                    len(manifest["dev_subsets"][d]) * (2 + cfg.generations * cfg.candidates_per_domain) + 2)
+                    for d in cfg.domains)
                 task_attempts = None if cfg.generations == 0 else sum(
                     cfg.repeats * (len(split["dev"]) * (3 + cfg.generations * cfg.candidates_per_domain)
                                    + 4 * len(split["holdout"])) for split in manifest["splits"].values())
                 print(json.dumps({"output": str(cfg.output), "splits": splits, "optimizer": cfg.optimizer_model,
+                                  "development_subsets": {d: {s: len(n) for s, n in subsets.items()}
+                                                          for d, subsets in manifest["dev_subsets"].items()},
+                                  "development_group_counts": {d: {g: list(groups.values()).count(g)
+                                                                    for g in sorted(set(groups.values()))}
+                                                               for d, groups in manifest["dev_groups"].items()},
                                   "independent_agents": list(cfg.domains),
                                   "max_inflight_candidates_per_agent": cfg.max_inflight_candidates_per_domain,
                                   "max_search_hours": cfg.max_hours,

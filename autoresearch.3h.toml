@@ -1,15 +1,15 @@
 # Two independent SDK researchers with a three-hour search deadline.
-# Four dev tasks per domain favor quick exploration; finalize on the untouched holdout.
+# Two hypotheses per domain, each evaluated on four balanced, disjoint development subsets.
 [research]
 contract = "hackathon.toml"
-output = "runs/autoresearch-sdk-3h"
+output = "runs/autoresearch-sdk-3h-subsets"
 optimizer_model = "gpt-6-astra"
 reasoning_effort = "high"
 max_output_tokens = 16000
 researcher_max_turns = 12
 generations = 0
-candidates_per_domain = 5
-max_inflight_candidates_per_domain = 5
+candidates_per_domain = 2
+max_inflight_candidates_per_domain = 2
 keep_top = 3
 max_parallel_suites = 10
 tasks_per_suite = 4
@@ -17,7 +17,7 @@ max_task_containers = 16
 repeats = 1
 seed = 42
 min_improvement = 0.001
-max_evaluations = 64
+max_evaluations = 128
 max_optimizer_calls = 120
 suite_timeout_seconds = 10800
 max_hours = 3
@@ -25,10 +25,12 @@ max_skill_chars = 24000
 
 [domains.health]
 skill = "submissions/aditya-tim/health"
-dev_file = "research/splits/health-3h-dev.txt"
+dev_subset_files = ["research/splits/health-balanced-1.txt", "research/splits/health-balanced-2.txt", "research/splits/health-balanced-3.txt", "research/splits/health-balanced-4.txt"]
+dev_groups_file = "research/splits/health-balanced-groups.json"
 holdout_file = "research/splits/health-holdout.txt"
 
 [domains.hle]
 skill = "submissions/aditya-tim/hle"
-dev_file = "research/splits/hle-3h-dev.txt"
+dev_subset_files = ["research/splits/hle-balanced-1.txt", "research/splits/hle-balanced-2.txt", "research/splits/hle-balanced-3.txt", "research/splits/hle-balanced-4.txt"]
+dev_groups_file = "research/splits/hle-balanced-groups.json"
 holdout_file = "research/splits/hle-holdout.txt"

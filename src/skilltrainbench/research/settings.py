@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 import tomllib
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 
@@ -13,6 +13,8 @@ class Domain:
     holdout_size: int = 24
     dev_file: str = ""
     holdout_file: str = ""
+    dev_subset_files: list[str] = field(default_factory=list)
+    dev_groups_file: str = ""
 
 
 @dataclass(frozen=True)
@@ -81,4 +83,9 @@ def load_settings(path: str | Path) -> Settings:
     for name, domain in domains.items():
         if domain.dev_size < 1 or domain.holdout_size < 1:
             raise ValueError(f"{name}: dev_size and holdout_size must be positive")
+        if not isinstance(domain.dev_subset_files, list) or any(
+                not isinstance(p, str) or not p for p in domain.dev_subset_files):
+            raise ValueError(f"{name}: dev_subset_files must be a list of paths")
+        if domain.dev_subset_files and domain.dev_file:
+            raise ValueError(f"{name}: choose dev_file or dev_subset_files, not both")
     return cfg

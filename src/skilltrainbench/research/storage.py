@@ -76,7 +76,15 @@ def split_tasks(cfg: Settings, contract: HackathonCfg) -> dict:
                 raise ValueError(f"{name}: split file is empty, duplicated, or has unknown tasks: {filename}")
             return names
 
-        dev, holdout = from_file(domain.dev_file), from_file(domain.holdout_file)
+        if domain.dev_subset_files and domain.dev_file:
+            raise ValueError(f"{name}: choose dev_file or dev_subset_files, not both")
+        if domain.dev_subset_files:
+            dev = [task for filename in domain.dev_subset_files for task in from_file(filename)]
+            if len(dev) != len(set(dev)):
+                raise ValueError(f"{name}: development subsets overlap")
+        else:
+            dev = from_file(domain.dev_file)
+        holdout = from_file(domain.holdout_file)
         reserved = set(dev or []) | set(holdout or [])
         remaining = [n for n in available if n not in reserved]
         random.Random(f"{cfg.seed}:{name}").shuffle(remaining)
@@ -94,10 +102,27 @@ def split_tasks(cfg: Settings, contract: HackathonCfg) -> dict:
     return splits
 
 
+def development_layout(cfg: Settings, splits: dict) -> tuple[dict, dict]:
+    subsets, groups = {}, {}
+    for name, domain in cfg.domains.items():
+        subsets[name] = {
+            f"s{i + 1:02d}": re.split(r"[,\s]+", cfg.path(filename).read_text().strip())
+            for i, filename in enumerate(domain.dev_subset_files)
+        } if domain.dev_subset_files else {"all": splits[name]["dev"]}
+        groups[name] = read_json(cfg.path(domain.dev_groups_file)) if domain.dev_groups_file else {}
+        if domain.dev_groups_file and (not isinstance(groups[name], dict)
+                or set(groups[name]) != set(splits[name]["dev"])
+                or any(not isinstance(g, str) or not g.strip() or len(g) > 100 for g in groups[name].values())):
+            raise ValueError(f"{name}: development groups must label exactly the development tasks")
+    return subsets, groups
+
+
 def manifest(cfg: Settings, contract: HackathonCfg) -> dict:
     splits = split_tasks(cfg, contract)
+    subsets, groups = development_layout(cfg, splits)
     return {
         "version": 1, "settings": cfg.identity(), "splits": splits,
+        "dev_subsets": subsets, "dev_groups": groups,
         "contract_sha256": digest(cfg.contract.read_bytes()),
         "dependency_lock_sha256": digest((cfg.root / "uv.lock").read_bytes()) if (cfg.root / "uv.lock").exists() else None,
         "runtime_sha256": tree_digest(Path(__file__).parents[1]),

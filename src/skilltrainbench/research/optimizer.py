@@ -25,6 +25,12 @@ scripts, compare failures, research general methods online, and develop hypothes
 Aim to fill available candidate slots with distinct, defensible hypotheses. Launch
 an initial batch promptly, then use completed results to guide subsequent experiments.
 Read /research/README.md and /research/brief.json first for paths and submission format.
+Each submitted skill is evaluated on every configured development subset. Compare
+overall scores and the per-subset and per-group breakdowns in status.json; seek
+improvements that transfer across subjects and task themes, and investigate regressions.
+The subsets are fixed, disjoint development panels, not held-out tests. Do not claim
+generalization from one strong subset or a partially completed candidate. The harness
+waits for all subsets and repeats before selecting by the mean reward over all tasks.
 
 Treat skill length and the overall problem-solving approach as experimental variables.
 More instructions are not evidence of a better skill. Do not default to appending
